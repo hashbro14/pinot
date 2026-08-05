@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinot Direct S3 Querying — Build Plan</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1d21; --muted: #5c6570; --line: #e3e7eb;
+    --accent: #0b5e8a; --accent-soft: #eaf3f8; --code-bg: #f5f7f9;
+    --warn-bg: #fff7e8; --warn-line: #e8c580;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --fg: #e8eaed; --muted: #9aa4ad; --line: #2b3138;
+      --accent: #5db4dd; --accent-soft: #1a2730; --code-bg: #1d2227;
+      --warn-bg: #2a2312; --warn-line: #7a6330;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 28px 96px; }
+  header { border-bottom: 3px solid var(--accent); padding-bottom: 20px; margin-bottom: 36px; }
+  h1 { margin: 0 0 6px; font-size: 30px; line-height: 1.25; }
+  .subtitle { color: var(--muted); font-size: 15px; }
+  h2 { font-size: 22px; margin: 44px 0 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+  h2 .num { color: var(--accent); margin-right: 8px; }
+  h3 { font-size: 17px; margin: 26px 0 8px; }
+  p { margin: 10px 0; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
+  code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font-size: 87%; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; margin: 14px 0;
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14.5px; display: block; overflow-x: auto; }
+  th, td { border: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--accent-soft); }
+  ul, ol { margin: 8px 0; padding-left: 26px; }
+  li { margin: 5px 0; }
+  .pill {
+    display: inline-block; background: var(--accent-soft); color: var(--accent);
+    font-size: 12.5px; font-weight: 600; border-radius: 20px; padding: 2px 12px; margin-right: 6px;
+  }
+  .proof {
+    background: var(--accent-soft); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 10px 14px; margin: 12px 0; font-size: 14.5px;
+  }
+  .proof strong { color: var(--accent); }
+  .callout {
+    background: var(--warn-bg); border: 1px solid var(--warn-line);
+    border-radius: 8px; padding: 12px 16px; margin: 14px 0; font-size: 14.5px;
+  }
+  .toc { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 16px 22px; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  footer { margin-top: 56px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Pinot Direct S3 Querying — Build Plan</h1>
+  <div class="subtitle">
+    Servers answer queries by reading segment bytes straight from the deep store — no local segment data,
+    no disk cache, nothing persisted per query.<br>
+    Fork: <code>hashbro14/pinot</code> · branch <code>feature/remote-segment-reads</code> · standalone (does <em>not</em> build on lazy loading)
+  </div>
+</header>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#goal">Goal, scope, and what is deliberately excluded</a></li>
+    <li><a href="#flow">What happens when you query — end to end</a></li>
+    <li><a href="#sketch">Architecture sketch</a></li>
+    <li><a href="#seams">What Pinot already provides (verified on master)</a></li>
+    <li><a href="#steps">Build steps 0–9</a></li>
+    <li><a href="#config">Configuration surface</a></li>
+    <li><a href="#risks">Hard problems and how the design answers them</a></li>
+    <li><a href="#metrics">Observability</a></li>
+    <li><a href="#validation">Validation battery</a></li>
+    <li><a href="#future">Deferred by design (future work)</a></li>
+  </ol>
+</div>
+
+<h2 id="goal"><span class="num">1.</span>Goal, scope, and what is deliberately excluded</h2>
+<p>
+For a remote-enabled OFFLINE table, a Pinot server holds <strong>no segment data at all</strong>. Every query reads
+exactly the byte ranges it needs (the relevant columns' index structures) directly from the deep store,
+computes over them in per-query memory buffers, returns results to the broker, and frees everything.
+The deep store is not a backup here — it is the storage engine.
+</p>
+<ul>
+  <li><strong>In scope:</strong> OFFLINE tables, segment format v3, S3-compatible deep stores via <code>PinotFS</code>
+      (S3 / MinIO / GCS), server-side only — brokers, controllers, and Helix segment assignment are unchanged.</li>
+  <li><strong>Deliberately excluded from v1:</strong> any disk cache, any block cache, LRU/eviction machinery,
+      lazy segment materialization, tier relocation. Always query S3. The seams are kept so a cache can be added
+      later without redesign, but v1 ships without one.</li>
+  <li><strong>Invariants (non-negotiable):</strong>
+    <ol>
+      <li>Tables without the config run the byte-identical classic local path — zero regression.</li>
+      <li>Opt-in twice: instance kill switch (default off) + per-table config.</li>
+      <li>Any degraded result is flagged in the broker response — never silent.</li>
+    </ol>
+  </li>
+</ul>
+
+<div class="callout">
+<strong>Two unavoidable residencies (physics, not caching):</strong>
+(1)&nbsp;<em>Segment metadata lives in server memory</em> — to turn “this query needs the dictionary of column
+<code>bla</code>” into “bytes 1,204,224–1,834,511 of <code>s3://…/columns.psf</code>”, the server needs each segment's
+<code>index_map</code> and <code>metadata.properties</code> (a few KB per segment), fetched <strong>once</strong> at the
+OFFLINE→ONLINE transition. Without it, every query would spend two extra S3 round-trips learning where its bytes are.
+(2)&nbsp;<em>A per-query fetch-bytes cap is mandatory</em> — with no disk involved, an unfiltered scan would pull
+gigabytes into per-query RAM and OOM-kill the server. <code>remote.query.max.fetch.bytes</code> fails such a query
+fast with an actionable error. Memory safety, not a cache.
+</div>
+
+<h2 id="flow"><span class="num">2.</span>What happens when you query — end to end</h2>
+<p><code>SELECT COUNT(*) FROM bla WHERE bla = 1</code> against a remote-enabled table:</p>
+<ol>
+  <li><strong>Broker</strong> — nothing new. The routing table (built from Helix assignment, unchanged) scatters the
+      query to the servers hosting <code>bla</code>'s segments.</li>
+  <li><strong>Server: segment resolution</strong> — each target segment was registered at its OFFLINE→ONLINE
+      transition: the server fetched the metadata trio (<code>metadata.properties</code>, <code>index_map</code>,
+      <code>creation.meta</code>) from the segment's <code>segment.download.url</code> in ZK — <em>the S3 location,
+      which already exists in Pinot for every segment</em> — parsed it into the in-memory registry, and reported
+      ONLINE. No data bytes were downloaded.</li>
+  <li><strong>Fetch planning</strong> — <code>RemoteAwareFetchPlanner</code> inspects the query: predicate on
+      <code>bla</code> → needs <code>bla</code>'s dictionary + inverted index (or forward index if no inverted exists);
+      <code>COUNT(*)</code> needs no projection columns. The in-memory <code>index_map</code> converts that to exact
+      byte ranges within <code>columns.psf</code>.</li>
+  <li><strong>Admission check</strong> — total planned bytes vs <code>remote.query.max.fetch.bytes</code>; over →
+      fail fast with “query requires X&nbsp;MB of remote reads; cap is Y&nbsp;MB”.</li>
+  <li><strong>Fetch</strong> — ranges are sorted, coalesced (gaps &lt; threshold merged into one GET), and fetched in
+      parallel via ranged S3 GETs into the query's <code>QueryScopedFetchBuffer</code> (memory, accounted, deadline-bounded).</li>
+  <li><strong>Execute</strong> — the standard operator tree runs unmodified: index readers see ordinary
+      <code>PinotDataBuffer</code>s that happen to be backed by the fetched ranges. Per-segment results are computed
+      exactly as on local data.</li>
+  <li><strong>Return &amp; free</strong> — server combines, broker merges, client gets the count. The query's buffers
+      are freed on <code>release()</code>. Nothing was written to disk; nothing survives the query.</li>
+</ol>
+
+<h2 id="sketch"><span class="num">3.</span>Architecture sketch</h2>
+<pre><code>                                   QUERY PATH (per query, per segment)
+Broker ──► ServerQueryExecutor
+              │
+              ▼
+      RemoteAwareFetchPlanner (Step 6)                     [FetchPlanner SPI]
+      QueryContext ──► (column, indexType) pairs the query needs
+              │  FetchContext
+              ▼
+      ImmutableSegmentImpl.prefetch / acquire / release    [existing upstream hooks]
+              │
+              ▼
+┌───────── RemoteSegmentDirectory (Step 5) ────────────────[fork: segment.store.remote]
+│   in-memory registry (Step 2):  metadata.properties + index_map + creation.meta
+│                                 (fetched ONCE at OFFLINE→ONLINE; a few KB/segment)
+│   Reader.getIndexFor(col, type) ──► index_map ──► (offset, size) in columns.psf
+│             │
+│             ▼
+│   RemotePinotDataBuffer (Step 4)         reads resolve into the query's buffer
+│             │
+│             ▼
+│   QueryScopedFetchBuffer (Step 3)        per-query, in-memory, freed at release()
+│     ├─ admission: max-fetch-bytes cap ──► fail fast when exceeded
+│     └─ RangeFetcher: sort + coalesce ──► parallel ranged GETs ──► PinotFS.readRange (Step 1)
+│                                                        │
+└────────────────────────────────────────────────────────┼─────────────
+                                                          ▼
+                                            S3 / MinIO  (columns.psf per segment;
+                                            located via ZK segment.download.url)
+
+NO DISK CACHE. NO LOCAL SEGMENT DATA. Every query reads S3.
+LOCAL TABLES: untouched — DefaultSegmentDirectoryLoader + mmap, byte-identical path.
+</code></pre>
+
+<h2 id="seams"><span class="num">4.</span>What Pinot already provides (verified on master)</h2>
+<table>
+  <tr><th>Seam</th><th>What it is</th><th>Role here</th></tr>
+  <tr>
+    <td><code>SegmentZKMetadata.segment.download.url</code></td>
+    <td>Deep-store URI recorded per segment at upload</td>
+    <td><strong>“How Pinot knows where the segment is on S3” — already exists, nothing to build</strong></td>
+  </tr>
+  <tr>
+    <td><code>SegmentDirectoryLoader</code> SPI + registry<br><small>pinot-segment-spi/…/loader/</small></td>
+    <td>Pluggable factory for how a segment's storage is opened</td>
+    <td><code>RemoteSegmentDirectoryLoader</code> plugs in via config — no engine patching</td>
+  </tr>
+  <tr>
+    <td><code>SegmentDirectory</code> / <code>Reader</code></td>
+    <td>The engine's only door to segment bytes: <code>getIndexFor(column, indexType) → PinotDataBuffer</code></td>
+    <td>The remote implementation lives entirely behind it</td>
+  </tr>
+  <tr>
+    <td><code>FetchPlanner</code> / <code>FetchContext</code><br><small>pinot-core/…/query/prefetch/</small></td>
+    <td>Plans required (column, indexType) pairs before operators run; javadoc explicitly anticipates slow storage backends</td>
+    <td>The fetch brain slots into an existing SPI</td>
+  </tr>
+  <tr>
+    <td><code>IndexSegment.prefetch / acquire / release(FetchContext)</code></td>
+    <td>Per-query lifecycle hooks</td>
+    <td>Where fetches launch and per-query buffers are freed</td>
+  </tr>
+  <tr>
+    <td>Segment <strong>v3 format</strong></td>
+    <td>All indexes in one <code>columns.psf</code> + <code>index_map</code> of (column, indexType) → offset/size</td>
+    <td>The byte-range map that makes selective reads possible with no format change</td>
+  </tr>
+</table>
+
+<h2 id="steps"><span class="num">5.</span>Build steps</h2>
+<p>Dependency-ordered; each step has a proof gate. After Step&nbsp;5 the system answers queries from S3 end to end;
+Steps 6–9 make it fast, safe, and shippable.</p>
+
+<h3><span class="pill">Step 0</span>Dev harness — the correctness oracle</h3>
+<ul>
+  <li>Docker compose: MinIO + controller + broker + 2 servers (quickstart configs).</li>
+  <li>Segment generator producing one real <strong>v3</strong> segment carrying every index type to support
+      (dictionary, forward, inverted, range, bloom, null-vector) from a few million synthetic rows.</li>
+  <li>Golden-query set — aggregations, filters per index type, <code>SELECT *</code>, group-by — expected results
+      captured against local execution.</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> golden queries pass on a plain local cluster. Every later step is measured against this oracle.</div>
+
+<h3><span class="pill">Step 1</span>Ranged reads in <code>PinotFS</code></h3>
+<ul>
+  <li><code>pinot-spi</code>: <code>default int readRange(URI uri, long offset, byte[] buf, int bufOffset, int length)</code>
+      (default throws — third-party FS implementations keep compiling).</li>
+  <li>Implement in <code>S3PinotFS</code> (<code>GetObject</code> with <code>Range</code> header) and
+      <code>LocalPinotFS</code> (seek+read, for tests).</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> unit test reads known ranges through both implementations, including EOF-truncated tails.</div>
+
+<h3><span class="pill">Step 2</span><code>RemoteSegmentRegistry</code> — metadata in memory, once</h3>
+<ul>
+  <li>At OFFLINE→ONLINE for a remote table: resolve <code>segment.download.url</code> from ZK, fetch <em>only</em>
+      the metadata trio (tar header-range read or an untarred layout — decided by the Step 0 spike), parse
+      <code>index_map</code> into <code>(column, indexType) → (offset, size)</code>, keep in a
+      <code>ConcurrentHashMap&lt;segmentName, RemoteSegmentEntry&gt;</code>. Entry also records CRC and total size.</li>
+  <li>Refresh messages re-fetch metadata (CRC change → new entry). OFFLINE/DROP transitions remove the entry.
+      Failure to fetch metadata at transition → Helix ERROR, exactly like a failed download today.</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> ONLINE registers with correct index_map offsets (validated against the real segment); refresh swaps CRC; DROP clears; a server restart re-registers from ZK without touching data bytes.</div>
+
+<h3><span class="pill">Step 3</span><code>QueryScopedFetchBuffer</code> + <code>RangeFetcher</code></h3>
+<ul>
+  <li><code>QueryScopedFetchBuffer</code>: per-(query, segment) container mapping fetched ranges → memory
+      (direct <code>ByteBuffer</code>s). Byte-accounted against <code>remote.query.max.fetch.bytes</code>
+      (admission errors before fetching). Freed wholesale on <code>release()</code> — try/finally, leak-checked in tests.</li>
+  <li><code>RangeFetcher</code>: sorts requested ranges, coalesces gaps &lt; <code>coalesce.gap.bytes</code> into single
+      GETs, executes on a bounded pool via <code>PinotFS.readRange</code>, retries with backoff, deduplicates identical
+      in-flight ranges <em>within</em> the query, emits metrics (GETs, bytes, latency).</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> coalescing (5 adjacent ranges → 1 GET); cap enforcement (over-budget plan → admission error, zero GETs fired); buffers freed on close (allocation tracker); concurrent fetches within one query dedupe.</div>
+
+<h3><span class="pill">Step 4</span><code>RemotePinotDataBuffer</code></h3>
+<ul>
+  <li>Extends <code>PinotDataBuffer</code>; a view <code>(segment, baseOffset, size)</code> over <code>columns.psf</code>;
+      every accessor (<code>getByte/getInt/getLong/getDouble/getBytes/copyTo</code>) resolves against the query's
+      <code>QueryScopedFetchBuffer</code>.</li>
+  <li>Reads inside prefetched ranges are pure memory. A read <em>outside</em> them (planner under-fetch) triggers a
+      synchronous ranged GET — correct but counted (<code>REMOTE_SYNC_MISSES</code>; the planner is iterated until ≈0).</li>
+  <li><code>view(start, end)</code> supported (index readers rely on views); all write methods throw.</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> property test — deterministic pseudo-random file; every accessor compared against <code>PinotByteBuffer</code> over thousands of random (offset, length) pairs; sync-miss path fetches and serves correctly.</div>
+
+<h3><span class="pill">Step 5</span><code>RemoteSegmentDirectory</code> + loader — first end-to-end milestone</h3>
+<ul>
+  <li><code>RemoteSegmentDirectoryLoader</code> (registered as <code>remote</code>): opens a segment purely from the
+      registry entry — no local files at all.</li>
+  <li><code>Reader.getIndexFor(col, type)</code> → <code>RemotePinotDataBuffer</code> view from the index-map entry.</li>
+  <li><code>prefetch(FetchContext)</code> → ranges → <code>RangeFetcher</code> (async);
+      <code>acquire</code> → deadline-bounded wait for planned ranges;
+      <code>release</code> → free the query's buffers.</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> golden-query harness — the same segment queried once locally, once remotely from MinIO: identical results on every query. <em>“Pinot answered from S3, nothing on disk.”</em></div>
+
+<h3><span class="pill">Step 6</span><code>RemoteAwareFetchPlanner</code></h3>
+<ul>
+  <li><code>planFetchForPruning</code>: bloom/range structures for predicate columns (small ranges; enables segment
+      pruning without fetching data columns). ZK time-range pruning happens before any fetch, as today.</li>
+  <li><code>planFetchForProcessing</code>: per query column — dictionary + forward index, plus inverted/range/sorted/json
+      index when segment metadata says it exists and the predicate can use it.</li>
+  <li>No-op for local segments (planner checks the directory type) — zero overhead on the classic path.</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> exact planned (column, indexType) sets asserted per representative query; golden filter query completes with <strong>zero synchronous misses</strong> after prefetch.</div>
+
+<h3><span class="pill">Step 7</span>Semantics: deadlines, failures, partial results</h3>
+<ul>
+  <li><code>acquire</code> waits <code>min(remaining query deadline, remote.fetch.timeout)</code>; expiry → the segment
+      is reported missing for this query — Pinot's existing flagged partial-result semantics.</li>
+  <li>S3 failure after retries → same flagged path; circuit breaker on consecutive failures per endpoint.</li>
+  <li>Strict mode: query option <code>failOnPartialRemote</code> — error instead of any partial result (audits).</li>
+  <li>Admission fail-fast (Step 3) is a query <em>error</em>, not a partial: “requires X&nbsp;MB remote reads, cap Y&nbsp;MB”.</li>
+</ul>
+<div class="proof"><strong>Proof gate:</strong> deadline expiry → flagged partial, no parked threads; MinIO killed mid-query → flagged partial + breaker opens; strict option → error; oversized scan → fail-fast message.</div>
+
+<h3><span class="pill">Step 8</span>Table config + wiring</h3>
+<ul>
+  <li>Table config: <code>"remoteQueryConfig": { "enabled": true }</code> — validation: OFFLINE tables only.</li>
+  <li>Instance kill switch <code>pinot.server.instance.remote.query.enabled=false</code> (default off).</li>
+  <li>Regression test: a table without the config runs the byte-identical classic path (assert the default loader
+      and default planner are used).</li>
+</ul>
+
+<h3><span class="pill">Step 9</span>Validation battery + benchmark report</h3>
+<ul>
+  <li>Full battery below (§9) + the numbers table: latency per query shape, GETs/query, bytes/query, $/query,
+      classic-path A/B vs master proving zero local regression.</li>
+</ul>
+
+<h2 id="config"><span class="num">6.</span>Configuration surface</h2>
+<pre><code># server.conf (instance level)
+pinot.server.instance.remote.query.enabled=false            # kill switch, default off
+pinot.server.instance.remote.query.max.fetch.bytes=1G       # per-query RAM admission cap
+pinot.server.instance.remote.fetch.parallelism=8
+pinot.server.instance.remote.fetch.timeout.seconds=30
+pinot.server.instance.remote.coalesce.gap.bytes=262144
+
+# table config (OFFLINE only)
+"remoteQueryConfig": {
+  "enabled": true
+}
+
+# query option (strict callers, e.g. audits)
+SET failOnPartialRemote = true;
+</code></pre>
+
+<h2 id="risks"><span class="num">7.</span>Hard problems and how the design answers them</h2>
+<table>
+  <tr><th>Problem</th><th>Answer in this design</th></tr>
+  <tr>
+    <td><strong>Big query OOM-kills the server</strong> — with no disk, unbounded fetches land in RAM</td>
+    <td>Per-query byte cap checked at admission, <em>before</em> any GET — exact sizes are known from the in-memory
+        index_map. Over the cap → fast, actionable error. The disk-full concern from the lazy-loading discussion,
+        answered at the memory level.</td>
+  </tr>
+  <tr>
+    <td><strong>Warm-path regression</strong> — buffer reads are Pinot's hottest path</td>
+    <td>Remote buffers are a separate class chosen at segment-open time; local segments keep existing mmap buffers
+        untouched. CI benchmark gate.</td>
+  </tr>
+  <tr>
+    <td><strong>Every query pays S3 latency</strong> — including the same query twice</td>
+    <td>Accepted, by explicit scope: “always query S3” is the v1 contract. Latency floor ≈ one coalesced GET round-trip
+        (tens of ms) + transfer. The SegmentDirectory seam admits a cache later without redesign (§10).</td>
+  </tr>
+  <tr>
+    <td><strong>Planner under-fetch</strong> — each miss is a synchronous ~30&nbsp;ms read on a query thread</td>
+    <td>Planner over-fetches rather than under-fetches; <code>REMOTE_SYNC_MISSES</code> alarms; iterate until ≈0 on the
+        golden set.</td>
+  </tr>
+  <tr>
+    <td><strong>S3 request economics</strong> — many small GETs cost real money</td>
+    <td>Range coalescing + bounded parallelism + per-table rate limit; benchmark report includes $/query so the trade
+        is explicit and tunable.</td>
+  </tr>
+  <tr>
+    <td><strong>Consistency on segment refresh</strong></td>
+    <td>Registry entries carry the CRC; refresh swaps the entry; in-flight queries finish on the old entry's ranges,
+        new queries see the new one.</td>
+  </tr>
+  <tr>
+    <td><strong>Selection-heavy queries</strong> (<code>SELECT *</code>, unfiltered scans)</td>
+    <td>They plan huge fetch sets and hit the admission cap with a clear error — the feature targets filtered/aggregate
+        analytics over cold data, and says so loudly rather than degrading silently.</td>
+  </tr>
+</table>
+
+<h2 id="metrics"><span class="num">8.</span>Observability</h2>
+<table>
+  <tr><th>Metric</th><th>Type</th><th>Meaning / alert</th></tr>
+  <tr><td><code>REMOTE_FETCH_GETS / BYTES / LATENCY_MS</code></td><td>meter / timer</td><td>S3 traffic, latency, and cost driver — per table</td></tr>
+  <tr><td><code>REMOTE_SYNC_MISSES</code></td><td>meter</td><td>planner under-fetch; should be ≈0, alarm otherwise</td></tr>
+  <tr><td><code>REMOTE_QUERY_FETCH_BYTES_P99</code></td><td>timer</td><td>how close queries run to the admission cap</td></tr>
+  <tr><td><code>REMOTE_ADMISSION_REJECTS</code></td><td>meter</td><td>queries refused by the byte cap — capacity/UX signal</td></tr>
+  <tr><td><code>REMOTE_PARTIAL_RESULTS</code></td><td>meter</td><td>deadline/failure degradations — reliability signal</td></tr>
+  <tr><td><code>REMOTE_REGISTRY_SEGMENTS</code></td><td>gauge</td><td>remote segments registered per table</td></tr>
+  <tr><td><code>REMOTE_QUERY_P99</code></td><td>timer</td><td>the user-facing promise</td></tr>
+</table>
+
+<h2 id="validation"><span class="num">9.</span>Validation battery</h2>
+<ol>
+  <li><strong>Correctness:</strong> golden queries, local vs remote parity on every index type; refresh mid-run
+      (in-flight query completes on old CRC, next query sees new data).</li>
+  <li><strong>Concurrency:</strong> parallel golden queries on the same segments — per-query buffers independent,
+      in-query dedup works, no cross-query interference.</li>
+  <li><strong>Chaos:</strong> MinIO killed mid-query → flagged partial + circuit breaker + self-heal on restart;
+      slow S3 (latency injection) → deadline semantics hold, no thread leaks.</li>
+  <li><strong>Memory:</strong> allocation tracking proves buffers freed after every query, including error paths;
+      sustained load shows flat heap/direct-memory.</li>
+  <li><strong>Bench report:</strong> latency by query shape (point filter / aggregate / group-by), GETs/query,
+      bytes/query, $/query, and the classic-path A/B vs master.</li>
+</ol>
+
+<h2 id="future"><span class="num">10.</span>Deferred by design (future work)</h2>
+<ul>
+  <li><strong>Block cache (disk or memory) with budget + LRU + admission</strong> — turns repeat queries warm; slots
+      behind the same <code>SegmentDirectory</code>/fetch seams with no redesign.</li>
+  <li><strong>Pinned hot structures</strong> (dictionaries, blooms) — the first thing such a cache would hold.</li>
+  <li><strong>Hybrid local/remote per table age</strong> (tierConfigs-driven demotion).</li>
+  <li><strong>Prefetch pipelining</strong> across operator stages.</li>
+</ul>
+
+<footer>
+  Pinot Direct S3 Querying — build plan · fork <code>hashbro14/pinot</code> · branch
+  <code>feature/remote-segment-reads</code> · prepared 2026-08-05 · standalone design: lazy segment loading is
+  intentionally not a dependency (supersedes the earlier cache-based draft)
+</footer>
+
+</div>
+</body>
+</html>
