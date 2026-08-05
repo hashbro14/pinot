@@ -79,6 +79,8 @@ import org.apache.pinot.segment.local.segment.index.dictionary.DictionaryIndexTy
 import org.apache.pinot.segment.local.segment.index.loader.IndexLoadingConfig;
 import org.apache.pinot.segment.local.segment.index.loader.LoaderUtils;
 import org.apache.pinot.segment.local.segment.index.loader.invertedindex.MultiColumnTextIndexHandler;
+import org.apache.pinot.segment.local.segment.store.RemoteQueryConfigs;
+import org.apache.pinot.segment.local.segment.store.RemoteSegmentRegistry;
 import org.apache.pinot.segment.local.startree.StarTreeBuilderUtils;
 import org.apache.pinot.segment.local.startree.v2.builder.StarTreeV2BuilderConfig;
 import org.apache.pinot.segment.local.upsert.PartitionUpsertMetadataManager;
@@ -496,6 +498,22 @@ public abstract class BaseTableDataManager implements TableDataManager {
   public void downloadAndLoadSegment(SegmentZKMetadata zkMetadata, IndexLoadingConfig indexLoadingConfig)
       throws Exception {
     String segmentName = zkMetadata.getSegmentName();
+    RemoteQueryConfigs remoteQueryConfigs = RemoteQueryConfigs.fromTableConfig(indexLoadingConfig.getTableConfig());
+    if (remoteQueryConfigs != null) {
+      // Remote-query table: segment data stays in the deep store. Fetch only the KB-sized metadata files so
+      // the segment can be opened through the remote segment-directory loader, and skip preprocessing
+      // (remote segments are read-only).
+      _logger.info("Loading remote segment: {} (no data download)", segmentName);
+      File remoteIndexDir = getSegmentDataDir(segmentName, zkMetadata.getTier(), indexLoadingConfig.getTableConfig());
+      RemoteSegmentRegistry.getInstance().getOrRegister(_tableNameWithType, segmentName,
+          String.valueOf(zkMetadata.getCrc()), remoteQueryConfigs.segmentBaseUri(segmentName), remoteIndexDir);
+      ImmutableSegment remoteSegment = ImmutableSegmentLoader.load(remoteIndexDir, indexLoadingConfig, false,
+          _segmentOperationsThrottlerSet, zkMetadata);
+      addSegment(remoteSegment, zkMetadata);
+      _logger.info("Loaded remote segment: {} with CRC: {} (data stays in deep store)", segmentName,
+          zkMetadata.getCrc());
+      return;
+    }
     _logger.info("Downloading and loading segment: {}", segmentName);
     File indexDir = downloadSegment(zkMetadata);
     ImmutableSegment immutableSegment =

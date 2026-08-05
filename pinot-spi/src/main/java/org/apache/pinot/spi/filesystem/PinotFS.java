@@ -286,6 +286,52 @@ public interface PinotFS extends Closeable, Serializable {
       throws IOException;
 
   /**
+   * Reads up to {@code length} bytes starting at byte {@code offset} of the file at the given location into
+   * {@code buffer}, beginning at {@code bufferOffset}.
+   *
+   * <p>Returns the number of bytes actually read, which is smaller than {@code length} only when the end of the
+   * file is reached before {@code length} bytes were read, or {@code -1} when {@code offset} is at or beyond the
+   * end of the file.
+   *
+   * <p>The default implementation opens the file and skips to the requested offset, which is correct for every
+   * file system but inefficient for remote ones. File systems with native ranged reads (e.g. object stores)
+   * should override it.
+   *
+   * @param uri location of the file to read
+   * @param offset byte offset within the file to start reading at
+   * @param buffer destination buffer
+   * @param bufferOffset offset within the destination buffer to write to
+   * @param length maximum number of bytes to read
+   * @return the number of bytes read, or -1 if the offset is at or beyond the end of the file
+   * @throws IOException on any IO error - missing file, not a file etc
+   */
+  default int readRange(URI uri, long offset, byte[] buffer, int bufferOffset, int length)
+      throws IOException {
+    if (offset < 0 || length < 0 || bufferOffset < 0 || bufferOffset + length > buffer.length) {
+      throw new IllegalArgumentException(
+          "Illegal range: offset=" + offset + ", length=" + length + ", bufferOffset=" + bufferOffset
+              + ", buffer.length=" + buffer.length);
+    }
+    try (InputStream inputStream = open(uri)) {
+      long remaining = offset;
+      while (remaining > 0) {
+        long skipped = inputStream.skip(remaining);
+        if (skipped > 0) {
+          remaining -= skipped;
+          continue;
+        }
+        // skip() could not make progress: read a single byte to detect end of file
+        if (inputStream.read() < 0) {
+          return -1;
+        }
+        remaining--;
+      }
+      int bytesRead = inputStream.readNBytes(buffer, bufferOffset, length);
+      return (bytesRead == 0 && length > 0) ? -1 : bytesRead;
+    }
+  }
+
+  /**
    * For certain filesystems, we may need to close the filesystem and do relevant operations to prevent leaks.
    * By default, this method does nothing.
    * @throws IOException on IO failure

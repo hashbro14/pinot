@@ -23,6 +23,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -193,6 +194,31 @@ public class LocalPinotFS extends BasePinotFS {
   public InputStream open(URI uri)
       throws IOException {
     return new BufferedInputStream(new FileInputStream(toFile(uri)));
+  }
+
+  @Override
+  public int readRange(URI uri, long offset, byte[] buffer, int bufferOffset, int length)
+      throws IOException {
+    if (offset < 0 || length < 0 || bufferOffset < 0 || bufferOffset + length > buffer.length) {
+      throw new IllegalArgumentException(
+          "Illegal range: offset=" + offset + ", length=" + length + ", bufferOffset=" + bufferOffset
+              + ", buffer.length=" + buffer.length);
+    }
+    try (RandomAccessFile file = new RandomAccessFile(toFile(uri), "r")) {
+      if (offset >= file.length()) {
+        return -1;
+      }
+      file.seek(offset);
+      int totalRead = 0;
+      while (totalRead < length) {
+        int read = file.read(buffer, bufferOffset + totalRead, length - totalRead);
+        if (read < 0) {
+          break;
+        }
+        totalRead += read;
+      }
+      return totalRead;
+    }
   }
 
   private static File toFile(URI uri) {

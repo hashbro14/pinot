@@ -1,3 +1,24 @@
+<!--
+
+    Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+-->
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -317,22 +338,91 @@ Steps 6–9 make it fast, safe, and shippable.</p>
       classic-path A/B vs master proving zero local regression.</li>
 </ul>
 
-<h2 id="config"><span class="num">6.</span>Configuration surface</h2>
+<h2 id="config"><span class="num">6.</span>Configuration surface (as implemented)</h2>
 <pre><code># server.conf (instance level)
-pinot.server.instance.remote.query.enabled=false            # kill switch, default off
-pinot.server.instance.remote.query.max.fetch.bytes=1G       # per-query RAM admission cap
-pinot.server.instance.remote.fetch.parallelism=8
-pinot.server.instance.remote.fetch.timeout.seconds=30
-pinot.server.instance.remote.coalesce.gap.bytes=262144
+# Selects the remote-aware segment directory loader. Tables WITHOUT remote.query.enabled
+# delegate to the default loader - this doubles as the kill switch.
+pinot.server.instance.segment.directory.loader=remote
 
-# table config (OFFLINE only)
-"remoteQueryConfig": {
-  "enabled": true
+# Existing upstream flag: wraps per-segment operators in acquire/release and runs the
+# fetch planner before execution - required for prefetch-driven remote reads.
+pinot.server.query.executor.enable.prefetch=true
+
+# table config (OFFLINE only) - customConfigs, so no TableConfig schema change:
+"customConfigs": {
+  "customConfigs": {
+    "remote.query.enabled": "true",
+    "remote.query.base.uri": "s3://my-bucket/pinot-remote/myTable/"
+  }
 }
-
-# query option (strict callers, e.g. audits)
-SET failOnPartialRemote = true;
 </code></pre>
+<p>Fetcher defaults (overridable via <code>RemoteIndexFetcher.init</code> at server startup): parallelism 8,
+coalesce gap 256&nbsp;KB, fetch timeout 30&nbsp;s. The per-query byte cap is the next wiring step (see status).</p>
+
+<h2 id="example"><span class="num">6b.</span>Worked example — running it end to end</h2>
+<h3>1. Publish a segment in the remote (untarred) layout</h3>
+<p>Compressed tarballs cannot be range-read, so a remote segment lives in the deep store as its untarred v3
+directory. For a segment named <code>myTable_16071_16101_0</code>:</p>
+<pre><code>s3://my-bucket/pinot-remote/myTable/
+  myTable_16071_16101_0/
+    v3/
+      columns.psf            &lt;- all index data (range-read at query time)
+      metadata.properties    &lt;- fetched once at segment load (KBs)
+      index_map              &lt;- fetched once at segment load (KBs)
+      creation.meta          &lt;- fetched once at segment load (KBs)
+
+# from a locally built segment:
+aws s3 cp --recursive /path/to/myTable_16071_16101_0 \
+    s3://my-bucket/pinot-remote/myTable/myTable_16071_16101_0/</code></pre>
+
+<h3>2. Configure (see §6) and load</h3>
+<p>On the segment's OFFLINE→ONLINE transition the server log shows the data download being skipped:</p>
+<pre><code>Loading remote segment: myTable_16071_16101_0 (no data download)
+Registered remote segment: myTable_16071_16101_0 (crc: 2145782409, indexEntries: 14, totalIndexBytes: 734003215) from s3://...
+Loaded remote segment: myTable_16071_16101_0 with CRC: 2145782409 (data stays in deep store)</code></pre>
+<p>Disk usage for the segment: ~10&nbsp;KB of metadata. The segment reports ONLINE and is routable.</p>
+
+<h3>3. Query</h3>
+<pre><code>SELECT COUNT(*) FROM myTable WHERE country = 'LB'</code></pre>
+<p>What happens inside the server, in order:</p>
+<ol>
+  <li>The (upstream) <code>DefaultFetchPlanner</code> plans the query's columns → a <code>FetchContext</code>
+      containing <code>country</code>.</li>
+  <li><code>RemoteSegmentDirectory.prefetch</code> expands that to the column's index entries present in the
+      segment (<code>dictionary</code>, <code>forward</code>, <code>inverted</code>…), starts async ranged GETs
+      against <code>columns.psf</code> (coalesced), and pins them for this query.</li>
+  <li><code>acquire</code> blocks until the pinned entries are resident in memory.</li>
+  <li>Operators execute unmodified — index readers see ordinary big-endian buffers.</li>
+  <li><code>release</code> unpins; entries with no remaining pins are freed. Nothing was written to disk.</li>
+</ol>
+<p>A read the planner did not anticipate follows the three-tier rule: resident → served from memory;
+no query active (segment load) → exact small ranged read into a bounded header cache; query active →
+the whole entry is promoted synchronously (counted as a sync miss) and freed once queries drain.</p>
+
+<h3>4. Implementation status</h3>
+<table>
+  <tr><th>Piece</th><th>Status</th></tr>
+  <tr><td>PinotFS.readRange + Local/S3 implementations</td><td>DONE — 14/14 SPI tests, 2/2 S3Mock tests</td></tr>
+  <tr><td>RemoteSegmentRegistry / RemoteSegmentMetadata (index_map parse, metadata trio)</td><td>DONE</td></tr>
+  <tr><td>RemoteIndexFetcher (coalescing, bounded pool)</td><td>DONE</td></tr>
+  <tr><td>RemoteSegmentDirectory + RemoteSegmentBuffer (3-tier reads, pin lifecycle)</td><td>DONE — 5/5 unit tests incl. byte parity vs local reads</td></tr>
+  <tr><td>RemoteSegmentDirectoryLoader (SPI, delegates for non-remote tables)</td><td>DONE</td></tr>
+  <tr><td>BaseTableDataManager: skip data download for remote tables</td><td>DONE (compiling)</td></tr>
+  <tr><td>Per-query max-fetch-bytes admission cap</td><td>NEXT</td></tr>
+  <tr><td>End-to-end cluster harness (MinIO + golden queries)</td><td>NEXT</td></tr>
+  <tr><td>Metrics, refresh/drop lifecycle tests, benchmark report</td><td>PENDING</td></tr>
+</table>
+
+<h3>5. Known limitations (v1, tracked)</h3>
+<ul>
+  <li>Registry entries are not yet removed on segment delete (the delete path lacks table config); entries are
+      KB-sized and CRC-keyed so correctness holds — cleanup wiring is a follow-up.</li>
+  <li>Index entries ≥ 2&nbsp;GB are rejected (single in-memory buffer per entry).</li>
+  <li>Star-tree and Lucene/text indexes are not served remotely yet (only <code>columns.psf</code> entries);
+      reload/preprocess of a remote segment is unsupported (read-only directory).</li>
+  <li>The per-query max-fetch-bytes admission cap and server metrics are the next wiring steps.</li>
+  <li>The magic marker preceding each entry is trusted, not validated, on the remote read path.</li>
+</ul>
 
 <h2 id="risks"><span class="num">7.</span>Hard problems and how the design answers them</h2>
 <table>

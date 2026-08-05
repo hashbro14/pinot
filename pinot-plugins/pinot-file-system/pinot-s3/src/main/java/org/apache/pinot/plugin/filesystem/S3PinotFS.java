@@ -1067,6 +1067,36 @@ public class S3PinotFS extends BasePinotFS {
   }
 
   @Override
+  public int readRange(URI uri, long offset, byte[] buffer, int bufferOffset, int length)
+      throws IOException {
+    if (offset < 0 || length < 0 || bufferOffset < 0 || bufferOffset + length > buffer.length) {
+      throw new IllegalArgumentException(
+          "Illegal range: offset=" + offset + ", length=" + length + ", bufferOffset=" + bufferOffset
+              + ", buffer.length=" + buffer.length);
+    }
+    if (length == 0) {
+      return 0;
+    }
+    String path = sanitizePath(uri.getPath());
+    // Ranged GET: an end beyond the object size is truncated by S3; a start at or beyond the object size is
+    // rejected with 416 (range not satisfiable), which maps to the -1 end-of-file contract of readRange.
+    String range = "bytes=" + offset + "-" + (offset + length - 1);
+    GetObjectRequest getObjectRequest =
+        GetObjectRequest.builder().bucket(uri.getHost()).key(path).range(range).build();
+    try (InputStream inputStream = retryWithS3CredentialRefresh(() -> _s3Client.getObject(getObjectRequest))) {
+      int bytesRead = inputStream.readNBytes(buffer, bufferOffset, length);
+      // Some S3-compatible stores answer an out-of-range start with an empty body instead of 416
+      return bytesRead == 0 ? -1 : bytesRead;
+    } catch (S3Exception e) {
+      // 416: requested range not satisfiable - the offset is at or beyond the end of the object
+      if (e.statusCode() == 416) {
+        return -1;
+      }
+      throw e;
+    }
+  }
+
+  @Override
   public void close()
       throws IOException {
     synchronized (_clientLock) {

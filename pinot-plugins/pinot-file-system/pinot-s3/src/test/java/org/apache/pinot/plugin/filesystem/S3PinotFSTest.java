@@ -442,6 +442,48 @@ public class S3PinotFSTest {
   }
 
   @Test(dataProvider = "scheme")
+  public void testReadRange(String scheme)
+      throws Exception {
+    String fileName = "read-range.bin";
+    int fileSize = 4096;
+    byte[] expected = new byte[fileSize];
+    for (int i = 0; i < fileSize; i++) {
+      expected[i] = (byte) (i * 31 + 7);
+    }
+    _s3Client.putObject(S3TestUtils.getPutObjectRequest(BUCKET, fileName, _s3PinotFS.getStorageClass()),
+        RequestBody.fromBytes(expected));
+    URI uri = URI.create(String.format(FILE_FORMAT, scheme, BUCKET, fileName));
+
+    // Mid-file range
+    byte[] buffer = new byte[100];
+    Assert.assertEquals(_s3PinotFS.readRange(uri, 1234, buffer, 0, 100), 100);
+    for (int i = 0; i < 100; i++) {
+      Assert.assertEquals(buffer[i], expected[1234 + i], "mismatch at " + i);
+    }
+
+    // Range with buffer offset
+    buffer = new byte[100];
+    Assert.assertEquals(_s3PinotFS.readRange(uri, 500, buffer, 40, 60), 60);
+    for (int i = 0; i < 60; i++) {
+      Assert.assertEquals(buffer[40 + i], expected[500 + i], "mismatch at " + i);
+    }
+
+    // Range truncated at the end of the object
+    buffer = new byte[100];
+    Assert.assertEquals(_s3PinotFS.readRange(uri, fileSize - 25, buffer, 0, 100), 25);
+    for (int i = 0; i < 25; i++) {
+      Assert.assertEquals(buffer[i], expected[fileSize - 25 + i], "mismatch at " + i);
+    }
+
+    // Offset at and beyond the end of the object
+    Assert.assertEquals(_s3PinotFS.readRange(uri, fileSize, buffer, 0, 10), -1);
+    Assert.assertEquals(_s3PinotFS.readRange(uri, fileSize + 1000, buffer, 0, 10), -1);
+
+    // Zero-length read
+    Assert.assertEquals(_s3PinotFS.readRange(uri, 0, buffer, 0, 0), 0);
+  }
+
+  @Test(dataProvider = "scheme")
   public void testMkdir(String scheme)
       throws Exception {
     String folderName = "my-test-folder";
