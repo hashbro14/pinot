@@ -121,7 +121,7 @@ public class RemoteQueryConfigs {
   }
 
   /** Largest index entry fetched whole; overridable with the matching system property. */
-  public static final String EAGER_PREFETCH_ENABLED = "pinot.server.instance.remote.eager.prefetch.enabled";
+  public static final String INSTANCE_EAGER_PREFETCH_ENABLED = "remote.eager.prefetch.enabled";
 
   /**
    * Whether acquiring a segment should pull every planned index entry whole, up to the promote ceiling.
@@ -132,11 +132,12 @@ public class RemoteQueryConfigs {
    * get it in one read, via the promote-on-miss path. Turn this on to restore the eager behaviour.
    */
   public static boolean eagerPrefetchEnabled() {
-    return Boolean.parseBoolean(System.getProperty(EAGER_PREFETCH_ENABLED, "false"));
+    return Boolean.parseBoolean(
+        System.getProperty("pinot.server.instance." + INSTANCE_EAGER_PREFETCH_ENABLED, "false"));
   }
 
-  public static final String PREFETCH_COALESCE_GAP_BYTES = "pinot.server.instance.remote.prefetch.coalesce.gap.bytes";
-  public static final long DEFAULT_PREFETCH_COALESCE_GAP_BYTES = 32L << 10; // 32 KB
+  public static final String INSTANCE_PREFETCH_COALESCE_GAP_BYTES = "remote.prefetch.coalesce.gap.bytes";
+  public static final long DEFAULT_PREFETCH_COALESCE_GAP_BYTES = 4L << 10; // 4 KB
 
   /**
    * How far apart two ranges of a batch can be and still be fetched as one.
@@ -147,15 +148,15 @@ public class RemoteQueryConfigs {
    * is cheap, merging generously wins — lower it when the deep store is nearer or rows are sparser.
    */
   public static long prefetchCoalesceGapBytes() {
-    return longProperty(PREFETCH_COALESCE_GAP_BYTES, DEFAULT_PREFETCH_COALESCE_GAP_BYTES);
+    return longProperty(INSTANCE_PREFETCH_COALESCE_GAP_BYTES, DEFAULT_PREFETCH_COALESCE_GAP_BYTES);
   }
 
-  public static final String PREFETCH_MAX_BYTES = "pinot.server.instance.remote.prefetch.max.bytes";
+  public static final String INSTANCE_PREFETCH_MAX_BYTES = "remote.prefetch.max.bytes";
   public static final long DEFAULT_PREFETCH_MAX_BYTES = 32L << 20; // 32 MB
 
   /** Ceiling on what one batch may pull; past it the entry is read whole instead. */
   public static long prefetchMaxBytes() {
-    return longProperty(PREFETCH_MAX_BYTES, DEFAULT_PREFETCH_MAX_BYTES);
+    return longProperty(INSTANCE_PREFETCH_MAX_BYTES, DEFAULT_PREFETCH_MAX_BYTES);
   }
 
   public static long promoteMaxBytes() {

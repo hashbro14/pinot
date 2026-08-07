@@ -543,9 +543,9 @@ WHERE all_video_streams = 0 LIMIT 1000</code>, measured from MinIO's own request
 </p>
 <table>
   <tr><th></th><th>Before</th><th>After</th><th></th></tr>
-  <tr><td>Time</td><td>4,397 ms</td><td><strong>~480 ms</strong></td><td>7.9× faster</td></tr>
-  <tr><td>Bytes read</td><td>789 MB</td><td><strong>89 MB</strong></td><td>8.9× less</td></tr>
-  <tr><td>GET requests</td><td>1,977</td><td><strong>25</strong></td><td>79× fewer</td></tr>
+  <tr><td>Time</td><td>4,397 ms</td><td><strong>~325 ms</strong></td><td>13× faster</td></tr>
+  <tr><td>Bytes read</td><td>789 MB</td><td><strong>66 MB</strong></td><td>12× less</td></tr>
+  <tr><td>GET requests</td><td>1,977</td><td><strong>18</strong></td><td>110× fewer</td></tr>
 </table>
 <p>
 The request count is the number that matters most for real S3. At 10–30 ms of first-byte latency, 1,977 requests
@@ -553,14 +553,29 @@ is 20–60 s of latency alone even if the bytes were free; 25 requests is under 
 were already good did not regress — a full-scan <code>GROUP BY artist_id</code> over all 2.59 M rows still reads
 11 MB in 4 requests and ~260 ms, because prefetching correctly declines to get involved.
 </p>
-<div class="warn">
-<strong>The remaining 89 MB is a deliberate trade, not a leftover.</strong> A thousand rows scattered across
-2.59 M leave small holes between the ranges they need. Merging across those holes reads bytes nobody asked for;
-splitting on them costs a round trip each. The merge distance is
-<code>remote.prefetch.coalesce.gap.bytes</code> (32 KB by default), tuned for object storage, where a request
-costs tens of milliseconds and bandwidth is cheap. Lower it when the deep store is nearer or the rows are
-sparser.
-</div>
+<h4>Tuning the merge distance</h4>
+<p>
+A thousand rows scattered across 2.59 M leave small holes between the ranges they need. Merging across a hole
+reads bytes nobody asked for; splitting on it costs a round trip. The naive reading of that trade — that
+object storage should merge generously, since a request costs tens of milliseconds and bandwidth is cheap —
+is wrong, and measurably so:
+</p>
+<table>
+  <tr><th><code>remote.prefetch.coalesce.gap.bytes</code></th><th>GETs</th><th>Bytes</th><th>Time</th></tr>
+  <tr><td>256 B</td><td>2,093</td><td>64.3 MB</td><td>3,642 ms</td></tr>
+  <tr><td>1 KB</td><td>1,121</td><td>64.4 MB</td><td>2,087 ms</td></tr>
+  <tr><td><strong>4 KB (default)</strong></td><td><strong>18</strong></td><td><strong>66.2 MB</strong></td><td><strong>396 ms</strong></td></tr>
+  <tr><td>32 KB</td><td>25</td><td>88.9 MB</td><td>577 ms</td></tr>
+  <tr><td>256 KB</td><td>51</td><td>292.6 MB</td><td>1,658 ms</td></tr>
+  <tr><td>4 MB</td><td>51</td><td>292.6 MB</td><td>1,323 ms</td></tr>
+</table>
+<p>
+The optimum is sharp, and it is not where the bytes-versus-requests trade alone would put it. Merging too
+generously pushes a batch past <code>remote.prefetch.max.bytes</code> or the whole-entry ratio, at which point
+prefetching declines altogether and the entry is read whole — <em>more</em> requests and more bytes, which is
+why 256 KB is worse than 32 KB on both axes. Merging too tightly loses the coalescing and every value costs its
+own round trip. Retune this if your rows are much sparser or denser than this table's.
+</p>
 
 <h2 id="proof"><span class="n">9.</span>How to prove it is really reading S3</h2>
 
