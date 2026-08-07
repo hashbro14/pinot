@@ -101,6 +101,14 @@ public class BytesDictionary extends BaseImmutableDictionary {
   }
 
   @Override
+  public void readBytesValues(int[] dictIds, int length, byte[][] outValues) {
+    prefetchValues(dictIds, length);
+    for (int i = 0; i < length; i++) {
+      outValues[i] = getBytesValue(dictIds[i]);
+    }
+  }
+
+  @Override
   public byte[] getBytesValue(int dictId) {
     return getBytes(dictId);
   }
@@ -112,6 +120,7 @@ public class BytesDictionary extends BaseImmutableDictionary {
 
   @Override
   public void read32BitsMurmur3HashValues(int[] dictIds, int length, int[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = get32BitsMurmur3Hash(dictIds[i], buffer);
@@ -120,6 +129,7 @@ public class BytesDictionary extends BaseImmutableDictionary {
 
   @Override
   public void read64BitsMurmur3HashValues(int[] dictIds, int length, long[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = get64BitsMurmur3Hash(dictIds[i], buffer);
@@ -128,6 +138,7 @@ public class BytesDictionary extends BaseImmutableDictionary {
 
   @Override
   public void read128BitsMurmur3HashValues(int[] dictIds, int length, long[][] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = get128BitsMurmur3HashValue(dictIds[i], buffer);

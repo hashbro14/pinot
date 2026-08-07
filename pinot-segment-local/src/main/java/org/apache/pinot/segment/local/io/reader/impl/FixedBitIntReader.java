@@ -26,9 +26,33 @@ import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
  */
 public abstract class FixedBitIntReader {
   final PinotDataBuffer _dataBuffer;
+  /** Set by {@link #getReader}; the subclasses are one per width and do not carry it themselves. */
+  private int _numBitsPerValue;
 
   private FixedBitIntReader(PinotDataBuffer dataBuffer) {
     _dataBuffer = dataBuffer;
+  }
+
+  /**
+   * Hints that the values at the first {@code length} entries of {@code indexes} are about to be read.
+   *
+   * <p>Values are bit-packed at a fixed width, so each index maps to a known byte range without reading
+   * anything first. Advisory: a no-op unless the buffer is backed by remote storage.
+   */
+  public void prefetch(int[] indexes, int length) {
+    if (length <= 0 || _numBitsPerValue <= 0 || !_dataBuffer.wantsPrefetch()) {
+      return;
+    }
+    long[] offsets = new long[length];
+    int[] lengths = new int[length];
+    for (int i = 0; i < length; i++) {
+      long bitOffset = (long) indexes[i] * _numBitsPerValue;
+      long startByte = bitOffset / Byte.SIZE;
+      long endByte = (bitOffset + _numBitsPerValue + Byte.SIZE - 1) / Byte.SIZE;
+      offsets[i] = startByte;
+      lengths[i] = Math.toIntExact(endByte - startByte);
+    }
+    _dataBuffer.prefetchRanges(offsets, lengths, length);
   }
 
   /**
@@ -50,6 +74,12 @@ public abstract class FixedBitIntReader {
   public abstract void read32(int index, int[] out, int outPos);
 
   public static FixedBitIntReader getReader(PinotDataBuffer dataBuffer, int numBitsPerValue) {
+    FixedBitIntReader reader = createReader(dataBuffer, numBitsPerValue);
+    reader._numBitsPerValue = numBitsPerValue;
+    return reader;
+  }
+
+  private static FixedBitIntReader createReader(PinotDataBuffer dataBuffer, int numBitsPerValue) {
     switch (numBitsPerValue) {
       case 1:
         return new Bit1Reader(dataBuffer);

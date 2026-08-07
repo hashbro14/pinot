@@ -63,6 +63,7 @@ public final class FixedBitSVForwardIndexReaderV2 implements ForwardIndexReader<
 
   @Override
   public void readDictIds(int[] docIds, int length, int[] dictIdBuffer, ForwardIndexReaderContext context) {
+    _reader.prefetch(docIds, length);
     int firstDocId = docIds[0];
     int lastDocId = docIds[length - 1];
     if (firstDocId <= lastDocId) {

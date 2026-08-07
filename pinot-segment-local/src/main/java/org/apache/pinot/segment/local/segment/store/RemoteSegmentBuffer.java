@@ -20,7 +20,14 @@ package org.apache.pinot.segment.local.segment.store;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
@@ -50,12 +57,45 @@ import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
  * (worst case a rebuilt view).
  */
 public class RemoteSegmentBuffer extends PinotDataBuffer {
+  private static final Logger LOGGER = LoggerFactory.getLogger(RemoteSegmentBuffer.class);
   /** Cap for the sub-range cache held per buffer. */
-  private static final long MAX_CACHED_SUB_RANGE_BYTES = 8L << 20;
+  private static final long MAX_CACHED_SUB_RANGE_BYTES = 64L << 20;
   /** Small reads are rounded up to this granularity to spare repeated header fetches. */
   private static final int MIN_FETCH_BYTES = 4096;
-  /** Read-ahead for reads on entries too large to promote, so scans are not one GET per value. */
-  private static final int LARGE_ENTRY_READ_AHEAD_BYTES = 256 << 10;
+  /**
+   * Read-ahead for a read that continues where the previous one stopped. Scans (group-by, full-column
+   * aggregation) walk an entry front to back, so pulling ahead in large chunks turns thousands of requests
+   * into a handful.
+   */
+  private static final int SEQUENTIAL_READ_AHEAD_BYTES = 1 << 20;
+  /**
+   * Read-ahead for a read that jumps somewhere else in the entry. Random access is what dictionary lookups
+   * do — resolving a value for one docId touches an offset slot and a few dozen bytes of payload — so reading
+   * ahead by hundreds of KB per lookup transfers orders of magnitude more than the query needs.
+   */
+  private static final int RANDOM_READ_AHEAD_BYTES = 16 << 10;
+  /** A read starting within this distance of the previous one still counts as sequential. */
+  private static final long SEQUENTIAL_GAP_BYTES = 64 << 10;
+  /**
+   * After this many random reads into the same entry, stop serving it range by range and materialize it in
+   * one streamed fetch. Scattered dictionary lookups are request-bound, not bandwidth-bound: a thousand
+   * round trips cost far more than one bulk transfer, and in spill mode the materialized entry is mapped
+   * from disk, so this costs no heap.
+   */
+  private static final int RANDOM_READS_BEFORE_MATERIALIZE = 96;
+  /** Layout of a variable-length dictionary (see VarLengthValueWriter): magic, version, count, data start. */
+  private static final byte[] VAR_LENGTH_MAGIC = {'.', 'v', 'l', ';'};
+  private static final int VAR_LENGTH_NUM_VALUES_OFFSET = 8;
+  private static final int VAR_LENGTH_DATA_SECTION_OFFSET_POSITION = 12;
+  private static final int VAR_LENGTH_HEADER_BYTES = 16;
+  /** Refuse to prime absurdly large offset tables; those fall back to ordinary ranged reads. */
+  private static final long MAX_OFFSET_TABLE_BYTES = 4L << 20;
+  /** Two prefetched ranges closer than this are merged: one bigger GET beats two with a hole between them. */
+  private static final long PREFETCH_COALESCE_GAP_BYTES = RemoteQueryConfigs.prefetchCoalesceGapBytes();
+  /** Give up on prefetching rather than blow the sub-range cache. */
+  private static final long MAX_PREFETCH_BYTES = RemoteQueryConfigs.prefetchMaxBytes();
+  /** Prefetching is declined once a batch spans more than 1/this of the entry. */
+  private static final int WHOLE_ENTRY_PREFETCH_RATIO = 4;
 
   private final RemoteSegmentDirectory _directory;
   private final IndexKey _key;
@@ -71,14 +111,85 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   /** Load-mode cache: start offset (within this buffer) -> fetched bytes. Guarded by itself. */
   private final NavigableMap<Long, byte[]> _subRanges = new TreeMap<>();
   private long _cachedSubRangeBytes;
+  /** End of the previous ranged read, used to tell a scan apart from random lookups. */
+  private volatile long _lastReadEnd = -1;
+  /** True when this entry is a dictionary, whose offset table is worth fetching up front. */
+  private final boolean _dictionary;
+  private volatile boolean _offsetTablePrimed;
+  private volatile byte[] _offsetTable;
+  private volatile int _offsetTableStart;
+  /** Ranged reads this buffer has actually issued; used by tests and for diagnosing fetch patterns. */
+  private final AtomicLong _rangeFetches = new AtomicLong();
+  /** Random (non-sequential) reads served so far; drives escalation to a single bulk fetch. */
+  private final java.util.concurrent.atomic.AtomicInteger _randomReads =
+      new java.util.concurrent.atomic.AtomicInteger();
 
   RemoteSegmentBuffer(RemoteSegmentDirectory directory, IndexKey key, long baseOffset, long size, ByteOrder order) {
+    this(directory, key, baseOffset, size, order, false);
+  }
+
+  RemoteSegmentBuffer(RemoteSegmentDirectory directory, IndexKey key, long baseOffset, long size, ByteOrder order,
+      boolean dictionary) {
     super(false);
     _directory = directory;
     _key = key;
     _baseOffset = baseOffset;
     _size = size;
     _order = order;
+    _dictionary = dictionary;
+  }
+
+  /**
+   * Reads the offset table of a variable-length dictionary in one shot and keeps it for this buffer's life.
+   *
+   * <p>Resolving one value of such a dictionary is three dependent reads: two into the offset table to learn
+   * where the value lives, then the value itself. Locally those are page-cache hits; against object storage
+   * each is a round trip, so a thousand-row projection becomes thousands of requests. The offset table is
+   * contiguous ((numValues + 1) * 4 bytes), so fetching it once turns every later lookup into a single read
+   * for the value bytes alone.
+   *
+   * <p>No-op for fixed-width dictionaries, whose value positions are computed arithmetically.
+   */
+  private void primeDictionaryOffsets() {
+    if (_offsetTable != null || _offsetTablePrimed) {
+      return;
+    }
+    _offsetTablePrimed = true;
+    try {
+      byte[] header = new byte[VAR_LENGTH_HEADER_BYTES];
+      _rangeFetches.incrementAndGet();
+      _directory.readDataRange(_key, _baseOffset, header, header.length);
+      ByteBuffer head = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN);
+      for (int i = 0; i < VAR_LENGTH_MAGIC.length; i++) {
+        if (header[i] != VAR_LENGTH_MAGIC[i]) {
+          return; // fixed-width dictionary: nothing to prime
+        }
+      }
+      int numValues = head.getInt(VAR_LENGTH_NUM_VALUES_OFFSET);
+      int offsetTableStart = head.getInt(VAR_LENGTH_DATA_SECTION_OFFSET_POSITION);
+      long offsetTableBytes = (numValues + 1L) * Integer.BYTES;
+      if (numValues <= 0 || offsetTableStart < 0 || offsetTableStart + offsetTableBytes > _size
+          || offsetTableBytes > MAX_OFFSET_TABLE_BYTES) {
+        return;
+      }
+      byte[] table = new byte[Math.toIntExact(offsetTableBytes)];
+      _rangeFetches.incrementAndGet();
+      _directory.readDataRange(_key, _baseOffset + offsetTableStart, table, table.length);
+      _offsetTableStart = offsetTableStart;
+      _offsetTable = table;
+    } catch (RuntimeException e) {
+      // Priming is an optimization; fall back to ordinary ranged reads
+      _offsetTable = null;
+    }
+  }
+
+  /** Serves a read out of the primed offset table when it covers the requested range. */
+  private ByteBuffer readFromOffsetTable(long offset, int length) {
+    byte[] table = _offsetTable;
+    if (table == null || offset < _offsetTableStart || offset + length > _offsetTableStart + table.length) {
+      return null;
+    }
+    return ByteBuffer.wrap(table, Math.toIntExact(offset - _offsetTableStart), length).order(_order);
   }
 
   /**
@@ -100,7 +211,37 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
     return _cachedResidentView;
   }
 
+  /** Number of ranged reads this buffer has issued since it was created. */
+  long getRangeFetchCount() {
+    return _rangeFetches.get();
+  }
+
+  private void cacheSubRange(long offset, byte[] fetched) {
+    synchronized (_subRanges) {
+      if (_subRanges.containsKey(offset)) {
+        return;
+      }
+      // Bounded cache: drop the lowest-offset ranges first (scans move forward)
+      while (_cachedSubRangeBytes + fetched.length > MAX_CACHED_SUB_RANGE_BYTES && !_subRanges.isEmpty()) {
+        Map.Entry<Long, byte[]> oldest = _subRanges.pollFirstEntry();
+        if (oldest == null) {
+          break;
+        }
+        _cachedSubRangeBytes -= oldest.getValue().length;
+      }
+      _subRanges.put(offset, fetched);
+      _cachedSubRangeBytes += fetched.length;
+    }
+  }
+
+  private boolean promotableSize() {
+    return _size <= _directory.getMaxPromoteBytes();
+  }
+
   private PinotDataBuffer promoteView() {
+    if (LOGGER.isDebugEnabled()) {
+      LOGGER.debug("PROMOTE-WHOLE-ENTRY key={} size={} baseOffset={}", _key, _size, _baseOffset);
+    }
     PinotDataBuffer resident = _directory.promoteSync(_key);
     PinotDataBuffer view = (_baseOffset == 0 && _size == resident.size() && _order == resident.order())
         ? resident : resident.view(_baseOffset, _baseOffset + _size, _order);
@@ -115,6 +256,14 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
       throw new IndexOutOfBoundsException(
           "Read [" + offset + ", +" + length + ") out of bounds for entry " + _key + " of size " + _size);
     }
+    // 0. Dictionary offset table: primed once, then served from memory
+    if (_dictionary) {
+      primeDictionaryOffsets();
+      ByteBuffer fromTable = readFromOffsetTable(offset, length);
+      if (fromTable != null) {
+        return fromTable;
+      }
+    }
     // 1. Cached sub-range?
     synchronized (_subRanges) {
       Map.Entry<Long, byte[]> floor = _subRanges.floorEntry(offset);
@@ -124,7 +273,7 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
     }
     // 2. Promote the whole entry only when it is small enough to be worth holding; a query-mode miss
     //    on a multi-GB entry must NOT materialize it (that is how a SELECT * OOMs the server).
-    boolean promotable = _size <= _directory.getMaxPromoteBytes();
+    boolean promotable = promotableSize();
     if (promotable && (_directory.inQueryMode() || length > MAX_CACHED_SUB_RANGE_BYTES)) {
       PinotDataBuffer view = promoteView();
       byte[] bytes = new byte[length];
@@ -134,29 +283,104 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
     if (!promotable && length > MAX_CACHED_SUB_RANGE_BYTES) {
       // Single read larger than the cache: serve it directly, uncached
       byte[] bytes = new byte[length];
+      _rangeFetches.incrementAndGet();
       _directory.readDataRange(_key, _baseOffset + offset, bytes, length);
       return ByteBuffer.wrap(bytes).order(_order);
     }
-    // 3. Ranged sub-read with read-ahead, cached per buffer within a bounded budget
-    int readAhead = promotable ? MIN_FETCH_BYTES : LARGE_ENTRY_READ_AHEAD_BYTES;
+    // 3. Ranged sub-read, with read-ahead chosen from the access pattern: a scan pulls ahead generously,
+    //    a random lookup (the dictionary case) fetches barely more than it needs.
+    int readAhead;
+    if (promotable) {
+      readAhead = MIN_FETCH_BYTES;
+    } else {
+      long lastEnd = _lastReadEnd;
+      boolean sequential = lastEnd >= 0 && offset >= lastEnd && offset - lastEnd <= SEQUENTIAL_GAP_BYTES;
+      if (!sequential && !wantsPrefetch() && _randomReads.incrementAndGet() > RANDOM_READS_BEFORE_MATERIALIZE) {
+        // Walking the entry at random with no batch hint to work from (so the reads cannot be coalesced):
+        // one bulk fetch beats hundreds more round trips. Entries that do get batch hints are excluded —
+        // materializing them would throw away the coalescing and pull the whole entry instead.
+        PinotDataBuffer view = promoteView();
+        byte[] bytes = new byte[length];
+        view.copyTo(offset, bytes, 0, length);
+        return ByteBuffer.wrap(bytes).order(_order);
+      }
+      readAhead = sequential ? SEQUENTIAL_READ_AHEAD_BYTES : RANDOM_READ_AHEAD_BYTES;
+    }
     int fetchLength = Math.toIntExact(Math.min(Math.max(length, readAhead), _size - offset));
+    _lastReadEnd = offset + fetchLength;
     byte[] fetched = new byte[fetchLength];
+    _rangeFetches.incrementAndGet();
     _directory.readDataRange(_key, _baseOffset + offset, fetched, fetchLength);
-    synchronized (_subRanges) {
-      if (!_subRanges.containsKey(offset)) {
-        // Bounded cache: drop the lowest-offset ranges first (scans move forward)
-        while (_cachedSubRangeBytes + fetchLength > MAX_CACHED_SUB_RANGE_BYTES && !_subRanges.isEmpty()) {
-          Map.Entry<Long, byte[]> oldest = _subRanges.pollFirstEntry();
-          if (oldest == null) {
-            break;
-          }
-          _cachedSubRangeBytes -= oldest.getValue().length;
-        }
-        _subRanges.put(offset, fetched);
-        _cachedSubRangeBytes += fetchLength;
+    cacheSubRange(offset, fetched);
+    return ByteBuffer.wrap(fetched, 0, length).order(_order);
+  }
+
+  @Override
+  public boolean wantsPrefetch() {
+    if (_cachedResident != null) {
+      // Already materialized locally: reads are memory-speed and hinting only adds work
+      return false;
+    }
+    return true;
+  }
+
+  @Override
+  public void prefetchRanges(long[] offsets, int[] lengths, int count) {
+    if (count <= 0) {
+      return;
+    }
+    long[][] sorted = new long[count][];
+    for (int i = 0; i < count; i++) {
+      sorted[i] = new long[]{offsets[i], offsets[i] + lengths[i]};
+    }
+    // Sort by offset so neighbouring values merge; dictIds arrive in row order, which is random here.
+    Arrays.sort(sorted, Comparator.comparingLong(r -> r[0]));
+
+    long total = 0;
+    long rangeStart = -1;
+    long rangeEnd = -1;
+    List<long[]> merged = new ArrayList<>();
+    for (long[] value : sorted) {
+      long start = value[0];
+      long end = value[1];
+      if (rangeStart < 0) {
+        rangeStart = start;
+        rangeEnd = end;
+      } else if (start <= rangeEnd + PREFETCH_COALESCE_GAP_BYTES) {
+        rangeEnd = Math.max(rangeEnd, end);
+      } else {
+        total += rangeEnd - rangeStart;
+        merged.add(new long[]{rangeStart, rangeEnd});
+        rangeStart = start;
+        rangeEnd = end;
       }
     }
-    return ByteBuffer.wrap(fetched, 0, length).order(_order);
+    if (rangeStart >= 0) {
+      total += rangeEnd - rangeStart;
+      merged.add(new long[]{rangeStart, rangeEnd});
+    }
+    if (total > MAX_PREFETCH_BYTES || total * WHOLE_ENTRY_PREFETCH_RATIO > _size) {
+      // The batch covers so much of the entry that reading it whole is the cheaper plan (a full scan
+      // looks like this). Decline, and let the ordinary promote/read-ahead path handle it.
+      return;
+    }
+    for (long[] range : merged) {
+      long start = range[0];
+      int len = Math.toIntExact(Math.min(range[1] - start, _size - start));
+      if (len <= 0) {
+        continue;
+      }
+      synchronized (_subRanges) {
+        Map.Entry<Long, byte[]> floor = _subRanges.floorEntry(start);
+        if (floor != null && floor.getKey() + floor.getValue().length >= start + len) {
+          continue;
+        }
+      }
+      byte[] fetched = new byte[len];
+      _rangeFetches.incrementAndGet();
+      _directory.readDataRange(_key, _baseOffset + start, fetched, len);
+      cacheSubRange(start, fetched);
+    }
   }
 
   @Override
@@ -260,7 +484,7 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   @Override
   public PinotDataBuffer view(long start, long end, ByteOrder byteOrder) {
     // Lazy: no fetch — the sub-view shares the same tiered read strategy
-    return new RemoteSegmentBuffer(_directory, _key, _baseOffset + start, end - start, byteOrder);
+    return new RemoteSegmentBuffer(_directory, _key, _baseOffset + start, end - start, byteOrder, _dictionary);
   }
 
   @Override
@@ -271,6 +495,7 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
       return promoteView().toDirectByteBuffer(offset, size, byteOrder);
     }
     byte[] bytes = new byte[size];
+    _rangeFetches.incrementAndGet();
     _directory.readDataRange(_key, _baseOffset + offset, bytes, size);
     return ByteBuffer.wrap(bytes).order(byteOrder);
   }
@@ -283,6 +508,8 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   public void release() {
     _cachedResident = null;
     _cachedResidentView = null;
+    _offsetTable = null;
+    _offsetTablePrimed = false;
     synchronized (_subRanges) {
       _subRanges.clear();
       _cachedSubRangeBytes = 0;

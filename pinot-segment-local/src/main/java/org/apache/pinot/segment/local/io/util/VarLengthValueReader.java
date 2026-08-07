@@ -61,6 +61,47 @@ public class VarLengthValueReader implements ValueReader {
     return _numValues;
   }
 
+
+  @Override
+  public void prefetch(int[] indexes, int length, int numBytesPerValue) {
+    if (length <= 0 || !_dataBuffer.wantsPrefetch()) {
+      return;
+    }
+    // Two phases, because a value's extent is itself stored in the dictionary. First pull the offset
+    // slots for this batch — they live in one contiguous table, so they coalesce into very little —
+    // then read them (now local) to learn where the values are, and pull those.
+    long[] offsets = new long[length];
+    int[] lengths = new int[length];
+    int count = 0;
+    for (int i = 0; i < length; i++) {
+      int index = indexes[i];
+      if (index < 0 || index >= _numValues) {
+        continue;
+      }
+      offsets[count] = _dataSectionStartOffSet + (long) Integer.BYTES * index;
+      lengths[count] = 2 * Integer.BYTES;
+      count++;
+    }
+    if (count == 0) {
+      return;
+    }
+    _dataBuffer.prefetchRanges(offsets, lengths, count);
+
+    int valueCount = 0;
+    for (int i = 0; i < count; i++) {
+      int offsetPosition = Math.toIntExact(offsets[i]);
+      int startOffset = _dataBuffer.getInt(offsetPosition);
+      int endOffset = _dataBuffer.getInt(offsetPosition + Integer.BYTES);
+      if (endOffset <= startOffset) {
+        continue;
+      }
+      offsets[valueCount] = startOffset;
+      lengths[valueCount] = endOffset - startOffset;
+      valueCount++;
+    }
+    _dataBuffer.prefetchRanges(offsets, lengths, valueCount);
+  }
+
   @Override
   public int getInt(int index) {
     throw new UnsupportedOperationException();

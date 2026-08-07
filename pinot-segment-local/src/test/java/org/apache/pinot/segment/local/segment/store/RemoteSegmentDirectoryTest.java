@@ -34,6 +34,9 @@ import org.apache.pinot.spi.config.table.TableCustomConfig;
 import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
 import org.apache.pinot.spi.utils.ReadMode;
+import java.nio.charset.StandardCharsets;
+import org.apache.pinot.segment.local.io.util.VarLengthValueWriter;
+import org.apache.pinot.segment.local.segment.index.readers.StringDictionary;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
@@ -56,6 +59,8 @@ public class RemoteSegmentDirectoryTest {
       new File(FileUtils.getTempDirectory(), RemoteSegmentDirectoryTest.class.getSimpleName());
   private static final String SEGMENT_NAME = "remoteSeg01";
   private static final String COLUMN = "col1";
+  private static final String STRING_COLUMN = "strCol";
+  private static final int NUM_STRINGS = 20000;
   private static final int DICT_SIZE = 64 * 1024;
   private static final int FWD_SIZE = 256 * 1024;
 
@@ -80,6 +85,11 @@ public class RemoteSegmentDirectoryTest {
           dict.putInt(i * 4L, i * 31 + 7);
         }
       }
+      byte[] varLengthDict = buildVarLengthDictionary();
+      try (PinotDataBuffer strDict = writer.newBuffer(STRING_COLUMN, StandardIndexes.dictionary(),
+          varLengthDict.length)) {
+        strDict.readFrom(0, varLengthDict, 0, varLengthDict.length);
+      }
       try (PinotDataBuffer fwd = writer.newBuffer(COLUMN, StandardIndexes.forward(), FWD_SIZE)) {
         for (int i = 0; i < FWD_SIZE / 4; i++) {
           fwd.putInt(i * 4L, i * 17 + 3);
@@ -89,13 +99,15 @@ public class RemoteSegmentDirectoryTest {
 
     Map<IndexKey, RemoteSegmentMetadata.IndexRange> ranges =
         RemoteSegmentMetadata.parseIndexMap(new File(_v3Dir, "index_map"), _v3Dir);
-    assertEquals(ranges.size(), 2);
+    assertEquals(ranges.size(), 3);
 
     _remoteMetadata = new RemoteSegmentMetadata(SEGMENT_NAME, "12345", _segmentBaseDir.toURI(),
         RemoteSegmentMetadata.columnsPsfUri(_segmentBaseDir.toURI()), ranges,
         ColumnIndexDirectoryTestHelper.writeMetadata(SegmentVersion.v3), _segmentBaseDir);
+    // Eager prefetching is off in production but is what the acquire/release lifecycle tests exercise
     _directory = new RemoteSegmentDirectory(_remoteMetadata,
-        new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30));
+        new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30),
+        RemoteQueryConfigs.DEFAULT_MAX_FETCH_BYTES_PER_QUERY, RemoteQueryConfigs.promoteMaxBytes(), true);
   }
 
   @AfterClass
@@ -103,6 +115,60 @@ public class RemoteSegmentDirectoryTest {
       throws Exception {
     _directory.close();
     FileUtils.deleteQuietly(DEEP_STORE_ROOT);
+  }
+
+  /** Serializes a var-length string dictionary the same way segment generation does. */
+  private static byte[] buildVarLengthDictionary()
+      throws Exception {
+    File tmp = new File(DEEP_STORE_ROOT, "varLengthDict.tmp");
+    try (VarLengthValueWriter writer = new VarLengthValueWriter(tmp, NUM_STRINGS)) {
+      for (int i = 0; i < NUM_STRINGS; i++) {
+        writer.add(expectedString(i).getBytes(StandardCharsets.UTF_8));
+      }
+    }
+    byte[] bytes = FileUtils.readFileToByteArray(tmp);
+    FileUtils.deleteQuietly(tmp);
+    return bytes;
+  }
+
+  /** Dictionaries are sorted, so pad to a fixed width to keep dictId order == value order. */
+  private static String expectedString(int i) {
+    return String.format("value-%08d", i);
+  }
+
+  /**
+   * A projection resolves a whole block of dictIds at once. Over remote storage that batch has to turn
+   * into a handful of coalesced ranged reads, not one read per value — while still returning exactly
+   * what the local dictionary would.
+   */
+  @Test
+  public void testBatchedDictionaryReadsAreCoalesced()
+      throws Exception {
+    // A promote ceiling below the dictionary size is what production hits with a multi-GB dictionary:
+    // the entry cannot be pulled whole, so the batch has to be coalesced instead.
+    try (RemoteSegmentDirectory directory = new RemoteSegmentDirectory(_remoteMetadata,
+        new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30), 1L << 30, 4096, true);
+        SegmentDirectory.Reader reader = directory.createReader()) {
+      RemoteSegmentBuffer buffer =
+          (RemoteSegmentBuffer) reader.getIndexFor(STRING_COLUMN, StandardIndexes.dictionary());
+      StringDictionary dictionary =
+          new StringDictionary(buffer, NUM_STRINGS, expectedString(0).length());
+
+      // 1000 dictIds scattered across the dictionary, in the arbitrary order a projection produces
+      int[] dictIds = new int[1000];
+      for (int i = 0; i < dictIds.length; i++) {
+        dictIds[i] = (i * 7919) % NUM_STRINGS;
+      }
+      String[] values = new String[dictIds.length];
+      dictionary.readStringValues(dictIds, dictIds.length, values);
+
+      for (int i = 0; i < dictIds.length; i++) {
+        assertEquals(values[i], expectedString(dictIds[i]), "wrong value for dictId " + dictIds[i]);
+      }
+      long fetches = buffer.getRangeFetchCount();
+      assertTrue(fetches < 100,
+          "batched dictionary read should coalesce into few ranged reads, issued " + fetches);
+    }
   }
 
   @Test

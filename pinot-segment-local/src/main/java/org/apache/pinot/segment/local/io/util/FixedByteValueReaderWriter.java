@@ -34,6 +34,20 @@ public final class FixedByteValueReaderWriter implements ValueReader {
   }
 
   @Override
+  public void prefetch(int[] indexes, int length, int numBytesPerValue) {
+    if (length <= 0 || numBytesPerValue <= 0 || !_dataBuffer.wantsPrefetch()) {
+      return;
+    }
+    long[] offsets = new long[length];
+    int[] lengths = new int[length];
+    for (int i = 0; i < length; i++) {
+      offsets[i] = (long) indexes[i] * numBytesPerValue;
+      lengths[i] = numBytesPerValue;
+    }
+    _dataBuffer.prefetchRanges(offsets, lengths, length);
+  }
+
+  @Override
   public int getInt(int index) {
     return _dataBuffer.getInt((long) index * Integer.BYTES);
   }

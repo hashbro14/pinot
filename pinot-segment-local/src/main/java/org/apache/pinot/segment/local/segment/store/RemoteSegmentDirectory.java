@@ -35,6 +35,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
 import org.apache.pinot.segment.spi.FetchContext;
 import org.apache.pinot.segment.spi.index.IndexType;
+import org.apache.pinot.segment.spi.index.StandardIndexes;
 import org.apache.pinot.segment.spi.index.metadata.SegmentMetadataImpl;
 import org.apache.pinot.segment.spi.memory.PinotByteBuffer;
 import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
@@ -66,6 +67,7 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
   private final long _maxFetchBytesPerQuery;
   /** Largest single index entry that a query-mode miss may promote wholesale. */
   private final long _maxPromoteBytes;
+  private final boolean _eagerPrefetch;
 
   /** Entries currently resident in memory, keyed by index entry. */
   private final ConcurrentHashMap<IndexKey, ResidentEntry> _resident = new ConcurrentHashMap<>();
@@ -103,6 +105,12 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher,
       long maxFetchBytesPerQuery, long maxPromoteBytes) {
+    this(metadata, fetcher, maxFetchBytesPerQuery, maxPromoteBytes, RemoteQueryConfigs.eagerPrefetchEnabled());
+  }
+
+  public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher,
+      long maxFetchBytesPerQuery, long maxPromoteBytes, boolean eagerPrefetch) {
+    _eagerPrefetch = eagerPrefetch;
     _metadata = metadata;
     _fetcher = fetcher;
     _maxFetchBytesPerQuery = maxFetchBytesPerQuery;
@@ -164,6 +172,12 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   @Override
   public void prefetch(FetchContext fetchContext) {
+    if (!_eagerPrefetch) {
+      // Nothing is pulled up front: the operators hand each buffer the batch of docIds/dictIds they are
+      // about to resolve, and that drives the fetching. An entry a query really does read end to end is
+      // still fetched whole, on its first miss.
+      return;
+    }
     List<IndexKey> planned = plannedKeys(fetchContext);
     long plannedBytes = 0;
     for (IndexKey key : planned) {
@@ -396,7 +410,7 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
         IndexKey key = new IndexKey(column, type);
         RemoteSegmentMetadata.IndexRange range = indexRange(key);
         return new RemoteSegmentBuffer(RemoteSegmentDirectory.this, key, 0, range.getDataSize(),
-            ByteOrder.BIG_ENDIAN);
+            ByteOrder.BIG_ENDIAN, type == StandardIndexes.dictionary());
       }
 
       @Override

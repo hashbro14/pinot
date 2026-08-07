@@ -392,6 +392,26 @@ public abstract class PinotDataBuffer implements DataBuffer {
     return getByte((long) offset);
   }
 
+  /**
+   * True when the buffer benefits from being told about a batch of reads before they happen.
+   *
+   * <p>Buffers backed by local memory or the page cache do not: a read costs a memory access, so
+   * describing it in advance is pure overhead. Buffers backed by remote object storage do, because
+   * a batch can be sorted and coalesced into a handful of ranged requests.
+   */
+  public boolean wantsPrefetch() {
+    return false;
+  }
+
+  /**
+   * Hints that the first {@code count} ranges of {@code offsets}/{@code lengths} are about to be read.
+   *
+   * <p>Advisory: implementations may fetch all, some, or none of them, and reads stay correct either
+   * way. Ranges need not be sorted or disjoint.
+   */
+  public void prefetchRanges(long[] offsets, int[] lengths, int count) {
+  }
+
   @Override
   public abstract byte getByte(long offset);
 

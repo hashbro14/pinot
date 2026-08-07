@@ -30,6 +30,14 @@ import org.apache.pinot.spi.utils.hash.MurmurHashFunctions;
  */
 public interface ValueReader extends Closeable {
 
+  /**
+   * Hints that the values at the first {@code length} entries of {@code indexes} are about to be read.
+   *
+   * <p>Advisory and a no-op by default; readers over remote storage use it to coalesce the reads.
+   */
+  default void prefetch(int[] indexes, int length, int numBytesPerValue) {
+  }
+
   int getInt(int index);
 
   long getLong(int index);

@@ -81,6 +81,82 @@ public abstract class BaseImmutableDictionary implements Dictionary {
     return normalizeIndex(insertionIndexOf(stringValue));
   }
 
+  @Override
+  public void readIntValues(int[] dictIds, int length, int[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readIntValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readIntValues(int[] dictIds, int length, Integer[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readIntValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readLongValues(int[] dictIds, int length, long[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readLongValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readLongValues(int[] dictIds, int length, Long[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readLongValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readFloatValues(int[] dictIds, int length, float[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readFloatValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readFloatValues(int[] dictIds, int length, Float[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readFloatValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readDoubleValues(int[] dictIds, int length, double[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readDoubleValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readDoubleValues(int[] dictIds, int length, Double[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readDoubleValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readBigDecimalValues(int[] dictIds, int length, BigDecimal[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readBigDecimalValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readStringValues(int[] dictIds, int length, String[] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readStringValues(dictIds, length, outValues);
+  }
+
+  @Override
+  public void readBytesValues(int[] dictIds, int length, byte[][] outValues) {
+    prefetchValues(dictIds, length);
+    Dictionary.super.readBytesValues(dictIds, length, outValues);
+  }
+
+  /**
+   * Hints that this batch of dictIds is about to be resolved, so a reader over remote storage can
+   * fetch their values together instead of one round trip at a time.
+   */
+  protected void prefetchValues(int[] dictIds, int length) {
+    if (_valueReader != null) {
+      _valueReader.prefetch(dictIds, length, _numBytesPerValue);
+    }
+  }
+
   protected final int normalizeIndex(int index) {
     return index >= 0 ? index : NULL_VALUE_INDEX;
   }

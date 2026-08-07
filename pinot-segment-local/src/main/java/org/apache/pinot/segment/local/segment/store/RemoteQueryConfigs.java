@@ -121,6 +121,43 @@ public class RemoteQueryConfigs {
   }
 
   /** Largest index entry fetched whole; overridable with the matching system property. */
+  public static final String EAGER_PREFETCH_ENABLED = "pinot.server.instance.remote.eager.prefetch.enabled";
+
+  /**
+   * Whether acquiring a segment should pull every planned index entry whole, up to the promote ceiling.
+   *
+   * <p>Off by default. Readers now hand the buffer the batch of docIds or dictIds they are about to
+   * resolve, so a selective query fetches just those ranges; pulling whole entries up front would read
+   * hundreds of megabytes to answer a ten-row lookup. Queries that really do touch a whole entry still
+   * get it in one read, via the promote-on-miss path. Turn this on to restore the eager behaviour.
+   */
+  public static boolean eagerPrefetchEnabled() {
+    return Boolean.parseBoolean(System.getProperty(EAGER_PREFETCH_ENABLED, "false"));
+  }
+
+  public static final String PREFETCH_COALESCE_GAP_BYTES = "pinot.server.instance.remote.prefetch.coalesce.gap.bytes";
+  public static final long DEFAULT_PREFETCH_COALESCE_GAP_BYTES = 32L << 10; // 32 KB
+
+  /**
+   * How far apart two ranges of a batch can be and still be fetched as one.
+   *
+   * <p>This is the bytes-versus-round-trips dial. A batch of scattered rows leaves small holes between
+   * the ranges it needs; merging across them reads bytes nobody asked for, but splitting on them costs
+   * a round trip each. Against object storage, where a request costs tens of milliseconds and bandwidth
+   * is cheap, merging generously wins — lower it when the deep store is nearer or rows are sparser.
+   */
+  public static long prefetchCoalesceGapBytes() {
+    return longProperty(PREFETCH_COALESCE_GAP_BYTES, DEFAULT_PREFETCH_COALESCE_GAP_BYTES);
+  }
+
+  public static final String PREFETCH_MAX_BYTES = "pinot.server.instance.remote.prefetch.max.bytes";
+  public static final long DEFAULT_PREFETCH_MAX_BYTES = 32L << 20; // 32 MB
+
+  /** Ceiling on what one batch may pull; past it the entry is read whole instead. */
+  public static long prefetchMaxBytes() {
+    return longProperty(PREFETCH_MAX_BYTES, DEFAULT_PREFETCH_MAX_BYTES);
+  }
+
   public static long promoteMaxBytes() {
     return longProperty(INSTANCE_PROMOTE_MAX_BYTES, DEFAULT_PROMOTE_MAX_BYTES);
   }

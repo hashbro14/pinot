@@ -97,6 +97,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readIntValues(int[] dictIds, int length, int[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Integer.parseInt(getUnpaddedString(dictIds[i], buffer));
@@ -105,6 +106,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readIntValues(int[] dictIds, int length, Integer[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Integer.parseInt(getUnpaddedString(dictIds[i], buffer));
@@ -113,6 +115,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readLongValues(int[] dictIds, int length, long[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Long.parseLong(getUnpaddedString(dictIds[i], buffer));
@@ -121,6 +124,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readLongValues(int[] dictIds, int length, Long[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Long.parseLong(getUnpaddedString(dictIds[i], buffer));
@@ -129,6 +133,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readFloatValues(int[] dictIds, int length, float[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Float.parseFloat(getUnpaddedString(dictIds[i], buffer));
@@ -137,6 +142,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readFloatValues(int[] dictIds, int length, Float[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Float.parseFloat(getUnpaddedString(dictIds[i], buffer));
@@ -145,6 +151,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readDoubleValues(int[] dictIds, int length, double[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Double.parseDouble(getUnpaddedString(dictIds[i], buffer));
@@ -153,6 +160,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readDoubleValues(int[] dictIds, int length, Double[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = Double.parseDouble(getUnpaddedString(dictIds[i], buffer));
@@ -161,6 +169,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readStringValues(int[] dictIds, int length, String[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = getUnpaddedString(dictIds[i], buffer);
@@ -169,6 +178,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void readBytesValues(int[] dictIds, int length, byte[][] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = getUnpaddedBytes(dictIds[i], buffer);
@@ -177,6 +187,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void read32BitsMurmur3HashValues(int[] dictIds, int length, int[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = get32BitsMurmur3Hash(dictIds[i], buffer);
@@ -185,6 +196,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void read64BitsMurmur3HashValues(int[] dictIds, int length, long[] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = get64BitsMurmur3Hash(dictIds[i], buffer);
@@ -193,6 +205,7 @@ public class StringDictionary extends BaseImmutableDictionary {
 
   @Override
   public void read128BitsMurmur3HashValues(int[] dictIds, int length, long[][] outValues) {
+    prefetchValues(dictIds, length);
     byte[] buffer = getBuffer();
     for (int i = 0; i < length; i++) {
       outValues[i] = get128BitsMurmur3HashValue(dictIds[i], buffer);
