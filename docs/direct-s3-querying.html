@@ -106,6 +106,7 @@
     <li><a href="#lifecycle">A query, end to end, with real output</a></li>
     <li><a href="#index">What happens when the column has no index</a></li>
     <li><a href="#numbers">Measured performance</a></li>
+    <li><a href="#batching">Fetching only the rows a query needs</a></li>
     <li><a href="#proof">How to prove it is really reading S3</a></li>
     <li><a href="#config">Configuration reference</a></li>
     <li><a href="#limits">Limits, known gaps, and what comes next</a></li>
@@ -463,7 +464,105 @@ charge. Real S3 adds roughly 10–30 ms of first-byte latency per GET. Query sha
 reads. Treat these figures as a lower bound.
 </div>
 
-<h2 id="proof"><span class="n">8.</span>How to prove it is really reading S3</h2>
+<h2 id="batching"><span class="n">8.</span>Fetching only the rows a query needs</h2>
+<p>
+The numbers above have an ugly spot in them: a hundred-row <code>SELECT *</code> costs about two seconds, and
+a thousand-row one cost 4.4 s while moving 789 MB and issuing 1,977 requests — to return roughly a megabyte of
+data. That is not the filter's fault. On the run below the filter itself accounted for about a millisecond;
+everything else was fetching.
+</p>
+
+<h4>Why a thousand rows cost a gigabyte</h4>
+<p>
+Resolving one dictionary-encoded value is three <em>dependent</em> reads. The forward index gives a dictId; the
+dictionary's offset table says where that value starts, the next slot says where it ends, and only then can the
+value bytes be read. Locally each of those is a page-cache hit costing about 100 ns, so nobody has ever had a
+reason to care. Against object storage each is a round trip. A thousand rows across nineteen columns is on the
+order of 57,000 of them.
+</p>
+<p>
+The buffer could not see any of this coming — it was handed one read at a time. Its only defences were guessing
+ahead (read-ahead, which fetches bytes nobody wants) and giving up and pulling the whole index entry
+(which fetches tens of megabytes to answer for ten rows). Both were tried, and both lost:
+</p>
+<table>
+  <tr><th>Strategy</th><th>GETs</th><th>Bytes</th><th>Time</th></tr>
+  <tr><td>256 KB fixed read-ahead</td><td>1,977</td><td>789 MB</td><td>4,397 ms</td></tr>
+  <tr><td>Adaptive 16 KB read-ahead for random access</td><td>1,953</td><td>338 MB</td><td>6,396 ms</td></tr>
+  <tr><td>Materialize the entry after 96 random reads</td><td>333</td><td>1,002 MB</td><td>6,882 ms</td></tr>
+</table>
+<p>
+Every one of those is a guess made with one read of context. The information needed to do better already exists
+one layer up and was being discarded: a projection does not resolve values one at a time, it resolves a
+<em>block</em> of up to 1,024 docIds at once, and hands the dictionary an entire array of dictIds.
+</p>
+
+<h4>The hint</h4>
+<p>
+So the batch is passed down instead of being thrown away. <code>PinotDataBuffer</code> gains two advisory
+methods — <code>wantsPrefetch()</code> and <code>prefetchRanges(offsets, lengths, count)</code> — that local
+buffers ignore entirely, because for them a read is a memory access and describing it in advance is pure
+overhead. The remote buffer implements them: it sorts the ranges, merges any pair close enough that reading
+the hole between them is cheaper than a second request, and fetches the result in a handful of ranged GETs.
+Every subsequent read is then served from what was already pulled.
+</p>
+<p>
+Three call sites feed it, each being a place where a whole batch is already in hand:
+</p>
+<ul>
+  <li><strong>Forward indexes</strong> (<code>FixedBitIntReader</code>, <code>FixedBitIntReaderWriter</code>):
+      values are bit-packed at a fixed width, so a docId maps to a byte range arithmetically — nothing has to
+      be read to plan the fetch.</li>
+  <li><strong>Fixed-width dictionaries</strong> (<code>FixedByteValueReaderWriter</code>): same, at
+      <code>dictId × width</code>.</li>
+  <li><strong>Variable-length dictionaries</strong> (<code>VarLengthValueReader</code>): two phases, because a
+      value's extent is itself stored in the dictionary. First fetch the batch's offset slots — they live in one
+      contiguous table, so a thousand scattered dictIds coalesce into very little — then read them, now local,
+      to learn where the values are, and fetch those.</li>
+</ul>
+<p>
+The hooks sit on the batch <code>read*Values</code> methods of <code>BaseImmutableDictionary</code>, so every
+column type inherits the behaviour, not just strings.
+</p>
+
+<h4>Turning off the eager fetch</h4>
+<p>
+One thing had to be removed for the hint to matter. Acquiring a segment used to pull every index entry the query
+planner listed, whole, up to the promote ceiling. For a full scan that is exactly right. For a ten-row lookup it
+is the entire problem: nineteen columns pulled whole is ~300 MB regardless of how few rows come back. Eager
+prefetching is now <strong>off by default</strong> (<code>remote.eager.prefetch.enabled</code> restores it).
+Nothing is lost for scans — a query that really does read an entry end to end still gets it in a single read via
+the existing promote-on-miss path, and prefetching declines any batch spanning more than a quarter of an entry
+precisely so that path stays in charge.
+</p>
+
+<h4>Result</h4>
+<p>
+Same query, same data, same server — <code>SELECT * FROM artist_dashboard_daily_streams_aggregated
+WHERE all_video_streams = 0 LIMIT 1000</code>, measured from MinIO's own request counters:
+</p>
+<table>
+  <tr><th></th><th>Before</th><th>After</th><th></th></tr>
+  <tr><td>Time</td><td>4,397 ms</td><td><strong>~480 ms</strong></td><td>7.9× faster</td></tr>
+  <tr><td>Bytes read</td><td>789 MB</td><td><strong>89 MB</strong></td><td>8.9× less</td></tr>
+  <tr><td>GET requests</td><td>1,977</td><td><strong>25</strong></td><td>79× fewer</td></tr>
+</table>
+<p>
+The request count is the number that matters most for real S3. At 10–30 ms of first-byte latency, 1,977 requests
+is 20–60 s of latency alone even if the bytes were free; 25 requests is under a second. Meanwhile the shapes that
+were already good did not regress — a full-scan <code>GROUP BY artist_id</code> over all 2.59 M rows still reads
+11 MB in 4 requests and ~260 ms, because prefetching correctly declines to get involved.
+</p>
+<div class="warn">
+<strong>The remaining 89 MB is a deliberate trade, not a leftover.</strong> A thousand rows scattered across
+2.59 M leave small holes between the ranges they need. Merging across those holes reads bytes nobody asked for;
+splitting on them costs a round trip each. The merge distance is
+<code>remote.prefetch.coalesce.gap.bytes</code> (32 KB by default), tuned for object storage, where a request
+costs tens of milliseconds and bandwidth is cheap. Lower it when the deep store is nearer or the rows are
+sparser.
+</div>
+
+<h2 id="proof"><span class="n">9.</span>How to prove it is really reading S3</h2>
 
 <h4>a. Watch the requests</h4>
 <pre><code>docker run --rm --network docker_pinotnet --entrypoint sh \
@@ -498,7 +597,7 @@ docker exec pinot-server sh -c 'ls /tmp/pinot/server/data/*/*/v3/columns.psf | w
   garbage-first heap  total 2840576K, used 839880K</code></pre>
 <p>Heap returns to a baseline between queries rather than growing — entries are released when the query ends.</p>
 
-<h2 id="config"><span class="n">9.</span>Configuration reference</h2>
+<h2 id="config"><span class="n">10.</span>Configuration reference</h2>
 
 <h4>Table (OFFLINE only)</h4>
 <pre><code>"metadata": {
@@ -534,7 +633,14 @@ pinot.server.query.executor.enable.prefetch=true        # upstream flag; drives 
 -Dpinot.server.instance.remote.promote.max.bytes=128M       # larger entries are read in ranges
 -Dpinot.server.instance.remote.fetch.parallelism=8
 -Dpinot.server.instance.remote.fetch.timeout.seconds=30
--Dpinot.server.instance.remote.coalesce.gap.bytes=256K</code></pre>
+-Dpinot.server.instance.remote.coalesce.gap.bytes=256K
+
+# --- batched reads (see §8) ---------------------------------------------
+-Dpinot.server.instance.remote.eager.prefetch.enabled=false      # ← default; true restores whole-entry
+                                                                 #   fetching at acquire time
+-Dpinot.server.instance.remote.prefetch.coalesce.gap.bytes=32K   # merge distance within one batch:
+                                                                 #   the bytes-vs-round-trips dial
+-Dpinot.server.instance.remote.prefetch.max.bytes=32M            # past this, read the entry whole</code></pre>
 
 <h4>The optional disk cache (not used above)</h4>
 <p>
@@ -545,7 +651,7 @@ performance profile completely — the same <code>SELECT *</code> measured 1,359
 number elsewhere in this document is from the cache-disabled configuration.
 </p>
 
-<h2 id="limits"><span class="n">10.</span>Limits, known gaps, and what comes next</h2>
+<h2 id="limits"><span class="n">11.</span>Limits, known gaps, and what comes next</h2>
 
 <h4>Design limits inherent to the approach</h4>
 <ul>
@@ -585,7 +691,7 @@ number elsewhere in this document is from the cache-disabled configuration.
       recreates its directory on demand.</li>
 </ul>
 
-<h2 id="run"><span class="n">11.</span>Running it yourself</h2>
+<h2 id="run"><span class="n">12.</span>Running it yourself</h2>
 <pre><code># 1. build the launcher jar from the fork
 cd ~/Desktop/pinot-s3/pinot
 JAVA_HOME=&lt;jdk21+&gt; ./mvnw -q -pl pinot-tools -am -DskipTests install
