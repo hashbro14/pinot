@@ -655,7 +655,9 @@ pinot.server.query.executor.enable.prefetch=true        # upstream flag; drives 
                                                                  #   fetching at acquire time
 -Dpinot.server.instance.remote.prefetch.coalesce.gap.bytes=32K   # merge distance within one batch:
                                                                  #   the bytes-vs-round-trips dial
--Dpinot.server.instance.remote.prefetch.max.bytes=32M            # past this, read the entry whole</code></pre>
+-Dpinot.server.instance.remote.prefetch.max.bytes=32M            # past this, read the entry whole
+-Dpinot.server.instance.remote.prefetch.max.ranges=32            # hard ceiling on requests per batch;
+                                                                 #   past it, read the entry whole</code></pre>
 
 <h4>The optional disk cache (not used above)</h4>
 <p>

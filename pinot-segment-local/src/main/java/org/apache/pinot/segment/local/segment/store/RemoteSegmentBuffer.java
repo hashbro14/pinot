@@ -96,6 +96,8 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   private static final long MAX_PREFETCH_BYTES = RemoteQueryConfigs.prefetchMaxBytes();
   /** Prefetching is declined once a batch spans more than 1/this of the entry. */
   private static final int WHOLE_ENTRY_PREFETCH_RATIO = 4;
+  /** Hard ceiling on requests issued for one batch; past it, reading the entry whole is cheaper. */
+  private static final int MAX_PREFETCH_RANGES = RemoteQueryConfigs.prefetchMaxRanges();
 
   private final RemoteSegmentDirectory _directory;
   private final IndexKey _key;
@@ -336,32 +338,46 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
     // Sort by offset so neighbouring values merge; dictIds arrive in row order, which is random here.
     Arrays.sort(sorted, Comparator.comparingLong(r -> r[0]));
 
-    long total = 0;
-    long rangeStart = -1;
-    long rangeEnd = -1;
-    List<long[]> merged = new ArrayList<>();
-    for (long[] value : sorted) {
-      long start = value[0];
-      long end = value[1];
-      if (rangeStart < 0) {
-        rangeStart = start;
-        rangeEnd = end;
-      } else if (start <= rangeEnd + PREFETCH_COALESCE_GAP_BYTES) {
-        rangeEnd = Math.max(rangeEnd, end);
-      } else {
+    // Merge, widening the gap until the batch fits in a bounded number of requests. Capping only the
+    // bytes is not enough: a batch scattered across an entry stays well under the byte ceiling while
+    // still needing roughly one request per value, and at a few hundred values per block, per column,
+    // per segment that is thousands of round trips for one query.
+    long gap = PREFETCH_COALESCE_GAP_BYTES;
+    List<long[]> merged;
+    long total;
+    while (true) {
+      merged = new ArrayList<>();
+      total = 0;
+      long rangeStart = -1;
+      long rangeEnd = -1;
+      for (long[] value : sorted) {
+        long start = value[0];
+        long end = value[1];
+        if (rangeStart < 0) {
+          rangeStart = start;
+          rangeEnd = end;
+        } else if (start <= rangeEnd + gap) {
+          rangeEnd = Math.max(rangeEnd, end);
+        } else {
+          total += rangeEnd - rangeStart;
+          merged.add(new long[]{rangeStart, rangeEnd});
+          rangeStart = start;
+          rangeEnd = end;
+        }
+      }
+      if (rangeStart >= 0) {
         total += rangeEnd - rangeStart;
         merged.add(new long[]{rangeStart, rangeEnd});
-        rangeStart = start;
-        rangeEnd = end;
       }
+      if (merged.size() <= MAX_PREFETCH_RANGES || gap >= _size) {
+        break;
+      }
+      gap *= 2;
     }
-    if (rangeStart >= 0) {
-      total += rangeEnd - rangeStart;
-      merged.add(new long[]{rangeStart, rangeEnd});
-    }
-    if (total > MAX_PREFETCH_BYTES || total * WHOLE_ENTRY_PREFETCH_RATIO > _size) {
-      // The batch covers so much of the entry that reading it whole is the cheaper plan (a full scan
-      // looks like this). Decline, and let the ordinary promote/read-ahead path handle it.
+    if (total > MAX_PREFETCH_BYTES || total * WHOLE_ENTRY_PREFETCH_RATIO > _size
+        || merged.size() > MAX_PREFETCH_RANGES) {
+      // Reading the entry whole is now the cheaper plan (a full scan looks like this, and so does a
+      // batch too scattered to merge). Decline; the promote-on-miss path pulls it in one bounded read.
       return;
     }
     for (long[] range : merged) {

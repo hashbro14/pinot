@@ -159,6 +159,21 @@ public class RemoteQueryConfigs {
     return longProperty(INSTANCE_PREFETCH_MAX_BYTES, DEFAULT_PREFETCH_MAX_BYTES);
   }
 
+  public static final String INSTANCE_PREFETCH_MAX_RANGES = "remote.prefetch.max.ranges";
+  public static final int DEFAULT_PREFETCH_MAX_RANGES = 32;
+
+  /**
+   * Ceiling on the requests one batch may issue before prefetching gives up and the entry is read whole.
+   *
+   * <p>The two failure modes sit on either side of this. Too low and a scattered batch is declined, so
+   * the query pays for whole entries it barely touches. Too high and a batch that cannot coalesce issues
+   * a round trip per value --- and a query issues one batch per block, per column, per segment, so that
+   * multiplies fast.
+   */
+  public static int prefetchMaxRanges() {
+    return (int) longProperty(INSTANCE_PREFETCH_MAX_RANGES, DEFAULT_PREFETCH_MAX_RANGES);
+  }
+
   public static long promoteMaxBytes() {
     return longProperty(INSTANCE_PROMOTE_MAX_BYTES, DEFAULT_PROMOTE_MAX_BYTES);
   }

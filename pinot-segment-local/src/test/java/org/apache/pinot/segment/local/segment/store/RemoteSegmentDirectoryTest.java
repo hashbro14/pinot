@@ -171,6 +171,42 @@ public class RemoteSegmentDirectoryTest {
     }
   }
 
+  /**
+   * A batch too scattered to coalesce must not turn into one request per value.
+   *
+   * <p>Bounding only the bytes is not enough: values spread thinly across a large entry stay well under
+   * any byte ceiling while still needing a round trip each, and a query issues one batch per block, per
+   * column, per segment. That is what turned a LIMIT 4000 into 19,277 GETs and a timeout.
+   */
+  @Test
+  public void testScatteredBatchDoesNotExplodeIntoOneRequestPerValue()
+      throws Exception {
+    try (RemoteSegmentDirectory directory = new RemoteSegmentDirectory(_remoteMetadata,
+        new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30), 1L << 30, 4096, true);
+        SegmentDirectory.Reader reader = directory.createReader()) {
+      RemoteSegmentBuffer buffer =
+          (RemoteSegmentBuffer) reader.getIndexFor(STRING_COLUMN, StandardIndexes.dictionary());
+      StringDictionary dictionary =
+          new StringDictionary(buffer, NUM_STRINGS, expectedString(0).length());
+
+      // Maximally scattered: every 20th value across the whole dictionary, so nothing merges at the
+      // default gap and the naive path would issue one request per value.
+      int[] dictIds = new int[NUM_STRINGS / 20];
+      for (int i = 0; i < dictIds.length; i++) {
+        dictIds[i] = i * 20;
+      }
+      String[] values = new String[dictIds.length];
+      dictionary.readStringValues(dictIds, dictIds.length, values);
+
+      for (int i = 0; i < dictIds.length; i++) {
+        assertEquals(values[i], expectedString(dictIds[i]), "wrong value for dictId " + dictIds[i]);
+      }
+      long fetches = buffer.getRangeFetchCount();
+      assertTrue(fetches < dictIds.length / 4,
+          "a scattered batch of " + dictIds.length + " values must not cost a request each, issued " + fetches);
+    }
+  }
+
   @Test
   public void testParityWithLocalReads()
       throws Exception {
