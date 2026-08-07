@@ -29,6 +29,10 @@ import org.apache.pinot.segment.spi.index.IndexType;
 import org.apache.pinot.segment.spi.index.StandardIndexes;
 import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
 import org.apache.pinot.segment.spi.store.SegmentDirectory;
+import org.apache.pinot.spi.config.table.TableConfig;
+import org.apache.pinot.spi.config.table.TableCustomConfig;
+import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
 import org.apache.pinot.spi.utils.ReadMode;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
@@ -226,5 +230,30 @@ public class RemoteSegmentDirectoryTest {
     _directory.release(fetchContext);
     assertFalse(_directory.inQueryMode());
     assertNull(_directory.peekResident(dictKey), "pins must drain on prefetch-only release");
+  }
+
+  @Test
+  public void testDimensionTableCannotBeRemote() {
+    // Dimension tables are replicated to every server for lookup joins and must be read locally
+    TableConfig dimTable = new TableConfigBuilder(TableType.OFFLINE).setTableName("dim").setIsDimTable(true)
+        .setCustomConfig(new TableCustomConfig(
+            Map.of(RemoteQueryConfigs.TABLE_REMOTE_QUERY_ENABLED, "true",
+                RemoteQueryConfigs.TABLE_REMOTE_QUERY_BASE_URI, "s3://bucket/dim/")))
+        .build();
+    assertThrows(IllegalStateException.class, () -> RemoteQueryConfigs.fromTableConfig(dimTable));
+  }
+
+  @Test
+  public void testRemoteTableRequiresBaseUri() {
+    TableConfig noUri = new TableConfigBuilder(TableType.OFFLINE).setTableName("t")
+        .setCustomConfig(new TableCustomConfig(Map.of(RemoteQueryConfigs.TABLE_REMOTE_QUERY_ENABLED, "true")))
+        .build();
+    assertThrows(IllegalStateException.class, () -> RemoteQueryConfigs.fromTableConfig(noUri));
+  }
+
+  @Test
+  public void testNonRemoteTableIsIgnored() {
+    TableConfig plain = new TableConfigBuilder(TableType.OFFLINE).setTableName("plain").build();
+    assertNull(RemoteQueryConfigs.fromTableConfig(plain), "plain tables must not be treated as remote");
   }
 }

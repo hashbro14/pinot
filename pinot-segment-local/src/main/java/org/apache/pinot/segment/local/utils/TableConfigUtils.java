@@ -78,6 +78,7 @@ import org.apache.pinot.spi.config.table.TagOverrideConfig;
 import org.apache.pinot.spi.config.table.TenantConfig;
 import org.apache.pinot.spi.config.table.TierConfig;
 import org.apache.pinot.spi.config.table.TimestampConfig;
+import org.apache.pinot.spi.config.table.TableCustomConfig;
 import org.apache.pinot.spi.config.table.UpsertConfig;
 import org.apache.pinot.spi.config.table.assignment.InstanceAssignmentConfig;
 import org.apache.pinot.spi.config.table.assignment.InstancePartitionsType;
@@ -187,6 +188,30 @@ public final class TableConfigUtils {
     }
   }
 
+  /**
+   * Rejects remote-query (deep-store served) configurations that cannot work: the feature applies to plain
+   * OFFLINE tables only, and requires the deep-store location of the table's segments.
+   */
+  @VisibleForTesting
+  static void validateRemoteQueryConfig(TableConfig tableConfig) {
+    TableCustomConfig customConfig = tableConfig.getCustomConfig();
+    if (customConfig == null || customConfig.getCustomConfigs() == null || !Boolean.parseBoolean(
+        customConfig.getCustomConfigs().get("remote.query.enabled"))) {
+      return;
+    }
+    Preconditions.checkState(tableConfig.getTableType() == TableType.OFFLINE,
+        "remote.query.enabled is only supported for OFFLINE tables, got: %s", tableConfig.getTableType());
+    Preconditions.checkState(!tableConfig.isDimTable(),
+        "remote.query.enabled is not supported for dimension tables: they are replicated to every server and "
+            + "must be read locally");
+    Preconditions.checkState(
+        tableConfig.getUpsertMode() == null || tableConfig.getUpsertMode() == UpsertConfig.Mode.NONE,
+        "remote.query.enabled is not supported for upsert tables");
+    String baseUri = customConfig.getCustomConfigs().get("remote.query.base.uri");
+    Preconditions.checkState(baseUri != null && !baseUri.isEmpty(),
+        "remote.query.enabled requires remote.query.base.uri (the deep-store location of the table's segments)");
+  }
+
   private static void validateEffectiveTableConfig(TableConfig tableConfig, Schema schema,
       Set<ValidationType> skipTypes) {
     // Sanitize the table config before validation
@@ -197,6 +222,7 @@ public final class TableConfigUtils {
     }
 
     validateValidationConfig(tableConfig, schema);
+    validateRemoteQueryConfig(tableConfig);
     validateSegmentAssignmentConfig(tableConfig);
     validateIngestionConfig(tableConfig, schema);
     if (tableConfig.getTableType() == TableType.REALTIME) {

@@ -61,7 +61,8 @@ public class RemoteSegmentDirectoryLoader implements SegmentDirectoryLoader {
             segmentBaseUri, localScratchDir);
     LOGGER.info("Loaded remote segment: {} for table: {} from: {} (no data download)", segmentName,
         context.getTableConfig().getTableName(), segmentBaseUri);
-    return new RemoteSegmentDirectory(metadata, RemoteIndexFetcher.getInstance());
+    return new RemoteSegmentDirectory(metadata, RemoteIndexFetcher.getInstance(),
+        RemoteQueryConfigs.maxFetchBytesPerQuery());
   }
 
   @Override

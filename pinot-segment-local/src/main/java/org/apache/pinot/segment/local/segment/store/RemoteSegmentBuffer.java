@@ -50,10 +50,12 @@ import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
  * (worst case a rebuilt view).
  */
 public class RemoteSegmentBuffer extends PinotDataBuffer {
-  /** Cap for the load-mode sub-range cache; past it, reads promote the whole entry instead. */
-  private static final long MAX_CACHED_SUB_RANGE_BYTES = 1L << 20;
+  /** Cap for the sub-range cache held per buffer. */
+  private static final long MAX_CACHED_SUB_RANGE_BYTES = 8L << 20;
   /** Small reads are rounded up to this granularity to spare repeated header fetches. */
   private static final int MIN_FETCH_BYTES = 4096;
+  /** Read-ahead for reads on entries too large to promote, so scans are not one GET per value. */
+  private static final int LARGE_ENTRY_READ_AHEAD_BYTES = 256 << 10;
 
   private final RemoteSegmentDirectory _directory;
   private final IndexKey _key;
@@ -120,19 +122,36 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
         return ByteBuffer.wrap(floor.getValue(), Math.toIntExact(offset - floor.getKey()), length).order(_order);
       }
     }
-    // 2. Query mode or oversized: promote the whole entry (no monitor held)
-    if (_directory.inQueryMode() || length > MAX_CACHED_SUB_RANGE_BYTES) {
+    // 2. Promote the whole entry only when it is small enough to be worth holding; a query-mode miss
+    //    on a multi-GB entry must NOT materialize it (that is how a SELECT * OOMs the server).
+    boolean promotable = _size <= _directory.getMaxPromoteBytes();
+    if (promotable && (_directory.inQueryMode() || length > MAX_CACHED_SUB_RANGE_BYTES)) {
       PinotDataBuffer view = promoteView();
       byte[] bytes = new byte[length];
       view.copyTo(offset, bytes, 0, length);
       return ByteBuffer.wrap(bytes).order(_order);
     }
-    // 3. Load mode: exact small ranged fetch (no monitor held), then cache under the monitor
-    int fetchLength = Math.toIntExact(Math.min(Math.max(length, MIN_FETCH_BYTES), _size - offset));
+    if (!promotable && length > MAX_CACHED_SUB_RANGE_BYTES) {
+      // Single read larger than the cache: serve it directly, uncached
+      byte[] bytes = new byte[length];
+      _directory.readDataRange(_key, _baseOffset + offset, bytes, length);
+      return ByteBuffer.wrap(bytes).order(_order);
+    }
+    // 3. Ranged sub-read with read-ahead, cached per buffer within a bounded budget
+    int readAhead = promotable ? MIN_FETCH_BYTES : LARGE_ENTRY_READ_AHEAD_BYTES;
+    int fetchLength = Math.toIntExact(Math.min(Math.max(length, readAhead), _size - offset));
     byte[] fetched = new byte[fetchLength];
     _directory.readDataRange(_key, _baseOffset + offset, fetched, fetchLength);
     synchronized (_subRanges) {
-      if (_cachedSubRangeBytes + fetchLength <= MAX_CACHED_SUB_RANGE_BYTES && !_subRanges.containsKey(offset)) {
+      if (!_subRanges.containsKey(offset)) {
+        // Bounded cache: drop the lowest-offset ranges first (scans move forward)
+        while (_cachedSubRangeBytes + fetchLength > MAX_CACHED_SUB_RANGE_BYTES && !_subRanges.isEmpty()) {
+          Map.Entry<Long, byte[]> oldest = _subRanges.pollFirstEntry();
+          if (oldest == null) {
+            break;
+          }
+          _cachedSubRangeBytes -= oldest.getValue().length;
+        }
         _subRanges.put(offset, fetched);
         _cachedSubRangeBytes += fetchLength;
       }
@@ -246,8 +265,14 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
 
   @Override
   public ByteBuffer toDirectByteBuffer(long offset, int size, ByteOrder byteOrder) {
-    // Contiguous memory is required here, so this is the one read path that forces residency
-    return promoteView().toDirectByteBuffer(offset, size, byteOrder);
+    // Contiguous memory is required here. Promote only entries small enough to hold; for larger ones
+    // fetch just the requested window so a single call cannot materialize a multi-GB entry.
+    if (_size <= _directory.getMaxPromoteBytes()) {
+      return promoteView().toDirectByteBuffer(offset, size, byteOrder);
+    }
+    byte[] bytes = new byte[size];
+    _directory.readDataRange(_key, _baseOffset + offset, bytes, size);
+    return ByteBuffer.wrap(bytes).order(byteOrder);
   }
 
   @Override

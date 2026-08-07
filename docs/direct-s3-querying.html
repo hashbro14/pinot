@@ -1,0 +1,620 @@
+<!--
+
+    Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinot Direct S3 Querying — What Was Built, and How It Behaves</title>
+<style>
+  :root {
+    --bg:#fff; --fg:#16191d; --muted:#5b646e; --line:#e2e6ea; --accent:#0b5e8a;
+    --accent-soft:#eaf3f8; --code-bg:#f6f8fa; --good:#1c7c4a; --good-soft:#e9f6ef;
+    --bad:#a3341f; --bad-soft:#fdeeea; --warn-bg:#fff8e8; --warn-line:#e3c377;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#131619; --fg:#e7eaed; --muted:#98a2ac; --line:#293036; --accent:#5cb3dc;
+      --accent-soft:#17242c; --code-bg:#1b2025; --good:#5cc98d; --good-soft:#16261d;
+      --bad:#e3806a; --bad-soft:#2a1a16; --warn-bg:#2a2412; --warn-line:#7c6532;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.65 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1020px;margin:0 auto;padding:44px 26px 110px}
+  header{border-bottom:3px solid var(--accent);padding-bottom:18px;margin-bottom:30px}
+  h1{margin:0 0 8px;font-size:31px;line-height:1.22}
+  .sub{color:var(--muted);font-size:15px}
+  h2{font-size:23px;margin:46px 0 12px;padding-top:12px;border-top:1px solid var(--line)}
+  h2 .n{color:var(--accent);margin-right:9px}
+  h3{font-size:17.5px;margin:28px 0 8px}
+  h4{font-size:15.5px;margin:20px 0 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  p{margin:10px 0}
+  code,pre{font-family:"SF Mono",Menlo,Consolas,monospace}
+  code{background:var(--code-bg);border-radius:4px;padding:1px 5px;font-size:87%}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:15px;
+    overflow-x:auto;font-size:12.5px;line-height:1.5;margin:14px 0}
+  pre code{background:none;padding:0}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14.5px;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--accent-soft)}
+  ul,ol{margin:8px 0;padding-left:26px} li{margin:5px 0}
+  .toc{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:14px 22px}
+  .toc a{color:var(--accent);text-decoration:none} .toc a:hover{text-decoration:underline}
+  .good{color:var(--good);font-weight:600}
+  .bad{color:var(--bad);font-weight:600}
+  .box{border-left:4px solid var(--accent);background:var(--accent-soft);
+    border-radius:0 8px 8px 0;padding:11px 15px;margin:14px 0;font-size:14.5px}
+  .warn{border:1px solid var(--warn-line);background:var(--warn-bg);border-radius:8px;
+    padding:12px 16px;margin:14px 0;font-size:14.5px}
+  .measured{background:var(--good-soft);border:1px solid var(--good);border-radius:8px;
+    padding:10px 15px;margin:14px 0;font-size:14.5px}
+  .measured strong{color:var(--good)}
+  .tag{display:inline-block;background:var(--accent-soft);color:var(--accent);font-size:12px;
+    font-weight:600;border-radius:20px;padding:2px 11px;margin-right:6px}
+  footer{margin-top:60px;color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Pinot Direct S3 Querying</h1>
+  <div class="sub">
+    Serving OFFLINE tables by reading segment bytes straight from the deep store — what was built,
+    how it differs from stock Pinot, and exactly what happens when a query runs.<br>
+    Fork <code>hashbro14/pinot</code> · branch <code>feature/remote-segment-reads</code> ·
+    every number in this document was measured on a real 5,153,926-row table.
+  </div>
+</header>
+
+<div class="warn">
+  <strong>Scope of this document:</strong> all timings and traces below are from the
+  <strong>no-local-cache configuration</strong> (<code>remote.cache.enabled=false</code>) — every query reads
+  from the object store, nothing is reused between queries. This is the configuration for judging deep-store
+  cost honestly. The disk-cache mode exists and is described in §9, but it is <em>not</em> what the numbers here
+  reflect.
+</div>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#what">What this changes, in one page</a></li>
+    <li><a href="#before-after">Before vs. after (stock Pinot vs. this fork)</a></li>
+    <li><a href="#arch">Architecture and data flow</a></li>
+    <li><a href="#added">Everything that was added, file by file</a></li>
+    <li><a href="#lifecycle">A query, end to end, with real output</a></li>
+    <li><a href="#index">What happens when the column has no index</a></li>
+    <li><a href="#numbers">Measured performance</a></li>
+    <li><a href="#proof">How to prove it is really reading S3</a></li>
+    <li><a href="#config">Configuration reference</a></li>
+    <li><a href="#limits">Limits, known gaps, and what comes next</a></li>
+    <li><a href="#run">Running it yourself</a></li>
+  </ol>
+</div>
+
+<h2 id="what"><span class="n">1.</span>What this changes, in one page</h2>
+<p>
+Stock Pinot requires every segment a server is assigned to be <strong>downloaded and stored locally</strong>
+before it can be queried. Local disk therefore has to be as large as the data, forever, even for data that is
+almost never read.
+</p>
+<p>
+This fork lets an OFFLINE table be marked <em>remote</em>. For such a table the server stores
+<strong>only each segment's metadata</strong> (about 36 KB per segment) and reads the actual index bytes from
+the deep store <strong>per query, by byte range</strong>, using the segment's <code>index_map</code> to know
+exactly which bytes to ask for.
+</p>
+
+<div class="measured">
+<strong>Measured on the real table</strong> (<code>artist_dashboard_daily_streams_aggregated</code>,
+2 segments, 5,153,926 rows):
+<pre><code>Deep store (MinIO)        2.0 GB    both segments' columns.psf — the only full copy
+Server segment directory   76 KB    metadata.properties + index_map + creation.meta
+columns.psf on the server      0    never downloaded
+
+SELECT COUNT(*)                                 →  6–8 ms      (metadata only, no S3 read)
+SELECT COUNT(*) WHERE artist_id = 72            →  75–104 ms   (19,225 matching rows)
+SELECT country_code, SUM(all_streams) GROUP BY  →  123–143 ms  (scans all 5.15M rows)
+SELECT * WHERE artist_id = 72 LIMIT 100         →  1.8–2.9 s   (all 19 columns needed)</code></pre>
+</div>
+
+<p>Three properties were treated as non-negotiable and hold today:</p>
+<ol>
+  <li><strong>Zero effect on normal tables.</strong> A table without the remote config runs the byte-identical
+      stock code path — the remote loader delegates to the default loader.</li>
+  <li><strong>Opt-in twice.</strong> An instance-level loader setting <em>and</em> a per-table config.</li>
+  <li><strong>Degradation is never silent.</strong> Failures surface as query exceptions or Pinot's existing
+      flagged partial results.</li>
+</ol>
+
+<h2 id="before-after"><span class="n">2.</span>Before vs. after</h2>
+<table>
+  <tr><th></th><th>Stock Pinot (before)</th><th>This fork, remote table (after)</th></tr>
+  <tr><td><strong>Segment assignment</strong></td>
+      <td>Helix ONLINE transition triggers a full segment download</td>
+      <td>Same transition fetches only the metadata trio (~36 KB); no data download</td></tr>
+  <tr><td><strong>Local disk needed</strong></td>
+      <td>≥ 100% of assigned data, permanently</td>
+      <td>Metadata only (76 KB for 2 GB of data here)</td></tr>
+  <tr><td><strong>Where query bytes come from</strong></td>
+      <td>Local file, <code>mmap</code>ed</td>
+      <td>Ranged GETs against <code>columns.psf</code> in the deep store</td></tr>
+  <tr><td><strong>Unit of I/O</strong></td>
+      <td>Whole segment, once, at assignment</td>
+      <td>Per (column, index-type) entry, per query; large entries in 256 KB ranges</td></tr>
+  <tr><td><strong>Cold-query latency</strong></td>
+      <td>None (data already local)</td>
+      <td>Pays the deep-store read: ~0.1 s to ~3 s depending on columns touched</td></tr>
+  <tr><td><strong>Failure if deep store is down</strong></td>
+      <td>Queries keep working (data is local)</td>
+      <td>Queries fail — the deep store is the storage engine, not a backup</td></tr>
+  <tr><td><strong>Brokers / controllers</strong></td>
+      <td>—</td>
+      <td>Unchanged. All changes are server-side</td></tr>
+</table>
+
+<h2 id="arch"><span class="n">3.</span>Architecture and data flow</h2>
+
+<h4>Stock Pinot</h4>
+<pre><code>  ┌──────────┐   assignment    ┌───────────────────────────────┐
+  │ Deep     │ ──────────────► │ SERVER                        │
+  │ store    │  download whole │  local disk: FULL segment     │
+  │ (S3)     │  segment ONCE   │  columns.psf  (GBs)           │
+  └──────────┘                 │        │ mmap                 │
+                               │        ▼                      │
+   (backup copy only)          │  query engine reads locally   │
+                               └───────────────────────────────┘</code></pre>
+
+<h4>This fork — remote table</h4>
+<pre><code>  ┌──────────────┐                    ┌────────────────────────────────────────┐
+  │ Deep store   │   assignment:      │ SERVER                                 │
+  │ (S3/MinIO)   │ ─ metadata only ─► │  local disk: metadata.properties       │
+  │              │   (~36 KB)         │               index_map                │
+  │ columns.psf  │                    │               creation.meta            │
+  │   segment A  │                    │  in memory:  index_map parsed into     │
+  │   segment B  │                    │              (column,indexType) →      │
+  └──────┬───────┘                    │              (offset,size)             │
+         │                            └───────────────┬────────────────────────┘
+         │   per query:                               │
+         │   ranged GET "bytes=17419741-17613962" ◄───┤ RemoteSegmentBuffer read
+         └────────────────────────────────────────────┘
+                            (274 such GETs measured for one SELECT *)</code></pre>
+
+<h4>Server-side components</h4>
+<pre><code>Broker ──► ServerQueryExecutor
+              │
+              ▼
+      FetchPlanner (upstream SPI)         "this query needs these columns"
+              │  FetchContext
+              ▼
+      ImmutableSegment.prefetch/acquire/release   (upstream hooks)
+              │
+              ▼
+  ┌── RemoteSegmentDirectory ───────────────────────────────── NEW ──┐
+  │   • admission control: planned bytes vs per-query budget          │
+  │   • pins entries ≤ promote ceiling; leaves big ones to ranged I/O │
+  │   • per-query pin/release lifecycle (idempotent)                  │
+  │            │                                                      │
+  │            ▼                                                      │
+  │   RemoteSegmentBuffer  (a PinotDataBuffer)  ───────────── NEW ──  │
+  │     resident? → serve from memory                                 │
+  │     else      → ranged read (256 KB), 8 MB bounded per-buffer     │
+  │            │                                                      │
+  │            ▼                                                      │
+  │   RemoteIndexFetcher   sort + coalesce ranges, bounded pool ─NEW─ │
+  │            │                                                      │
+  └────────────┼──────────────────────────────────────────────────────┘
+               ▼
+        PinotFS.readRange(uri, offset, buf, off, len)  ───────── NEW ──
+               │
+               ▼
+        S3PinotFS → GetObject with "Range: bytes=..."</code></pre>
+
+<h2 id="added"><span class="n">4.</span>Everything that was added, file by file</h2>
+<table>
+  <tr><th>Module / file</th><th>What it does</th><th>New?</th></tr>
+  <tr>
+    <td><code>pinot-spi</code><br><code>filesystem/PinotFS.java</code></td>
+    <td>New <code>readRange(uri, offset, buffer, bufferOffset, length)</code>. Default implementation is
+        open+skip so every existing file system keeps working; returns −1 past end-of-file.</td>
+    <td>method</td>
+  </tr>
+  <tr>
+    <td><code>filesystem/LocalPinotFS.java</code></td>
+    <td>Native override using <code>RandomAccessFile.seek</code>.</td><td>method</td>
+  </tr>
+  <tr>
+    <td><code>filesystem/NoClosePinotFS.java</code></td>
+    <td>Delegates <code>readRange</code>. <em>Critical:</em> <code>PinotFSFactory</code> wraps every file
+        system in this class, so without the delegation every "ranged" read silently fell back to
+        downloading the whole object.</td>
+    <td>method</td>
+  </tr>
+  <tr>
+    <td><code>pinot-s3</code><br><code>S3PinotFS.java</code></td>
+    <td>Native ranged <code>GetObject</code> with a <code>Range</code> header; HTTP 416 and empty-body
+        responses map to the −1 end-of-file contract.</td>
+    <td>method</td>
+  </tr>
+  <tr>
+    <td><code>pinot-segment-local</code><br><code>RemoteQueryConfigs.java</code></td>
+    <td>Reads the table opt-in from <code>metadata.customConfigs</code>, resolves each segment's deep-store
+        URI, and exposes the instance tunables.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>RemoteSegmentMetadata.java</code></td>
+    <td>Parses <code>index_map</code> into <code>(column, indexType) → (offset, size)</code>, using the same
+        key parsing as <code>SingleFileIndexDirectory</code>, and accounts for the 8-byte magic marker.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>RemoteSegmentRegistry.java</code></td>
+    <td>Per-server registry: fetches the metadata trio once per segment, keyed by table + segment + CRC, so a
+        refreshed segment can never be served from stale metadata.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>RemoteIndexFetcher.java</code></td>
+    <td>Sorts requested ranges, coalesces neighbours within 256 KB into one GET, executes on a bounded pool,
+        with a separate coordinator pool so orchestration can never starve the GETs it waits on.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>RemoteSegmentBuffer.java</code></td>
+    <td>A <code>PinotDataBuffer</code> that resolves reads three ways: resident entry → memory; no query
+        active → small exact ranged read; query active and entry not resident → promote or ranged read
+        depending on size. Lazy <code>view()</code>, read-only.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>RemoteSegmentDirectory.java</code></td>
+    <td>The <code>SegmentDirectory</code> for a remote segment: admission control, prefetch planning, the
+        per-query pin/release lifecycle, and entry materialization.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>RemoteEntryDiskCache.java</code></td>
+    <td>Optional disk cache (§9). Disabled in the configuration this document describes.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>loader/RemoteSegmentDirectoryLoader.java</code></td>
+    <td>Registered as <code>@SegmentLoader(name = "remote")</code>. Opens remote segments; delegates to the
+        default loader for every non-remote table.</td>
+    <td class="good">new</td>
+  </tr>
+  <tr>
+    <td><code>pinot-core</code><br><code>BaseTableDataManager.java</code></td>
+    <td>In <code>downloadAndLoadSegment</code>: for a remote table, register metadata and load through the
+        remote loader instead of downloading the segment.</td>
+    <td>~20 lines</td>
+  </tr>
+  <tr>
+    <td>Tests</td>
+    <td><code>PinotFSReadRangeTest</code> (14), <code>S3PinotFSTest#testReadRange</code> (2),
+        <code>RemoteSegmentDirectoryTest</code> (7: byte-parity against a real v3 segment, pin/release
+        lifecycle, double-release, prefetch-only release, query-mode promotion).</td>
+    <td class="good">23 tests</td>
+  </tr>
+</table>
+
+<h2 id="lifecycle"><span class="n">5.</span>A query, end to end, with real output</h2>
+<p>The query, run against the live cluster with the disk cache disabled:</p>
+<pre><code>SELECT * FROM artist_dashboard_daily_streams_aggregated WHERE artist_id = 72 LIMIT 100</code></pre>
+
+<h4>Step 0 — state before the query</h4>
+<pre><code>MinIO:                    2.0 GB   (2 × columns.psf ≈ 1 GB each)
+Server segment directory:  76 KB   metadata only
+Server cache directory:    empty   (caching disabled)</code></pre>
+
+<h4>Step 1 — broker</h4>
+<p>Unchanged from stock Pinot. Routing comes from Helix; the broker does not know the table is remote.</p>
+
+<h4>Step 2 — segment pruning, no S3 traffic</h4>
+<p>
+Each segment's <code>metadata.properties</code> is already in server memory and carries per-column min/max
+values, so segments that cannot contain <code>artist_id = 72</code> are eliminated before any byte is read.
+In this table that removed <strong>one of the two segments</strong> at zero cost.
+</p>
+
+<h4>Step 3 — fetch planning</h4>
+<p>
+<code>SELECT *</code> expands to all 19 columns. The in-memory <code>index_map</code> turns that into exact
+byte ranges inside <code>columns.psf</code>. Admission control compares the total against the per-query budget
+(1 GB); over budget, the query is served by ranged reads rather than materialization, so it can never exhaust
+server memory.
+</p>
+
+<h4>Step 4 — reading, by index type</h4>
+<table>
+  <tr><th>#</th><th>What is read</th><th>Why</th><th>Size</th></tr>
+  <tr><td>1</td><td><code>artist_id.dictionary</code></td><td>binary search maps the literal 72 → dictionary id</td><td>~2 MB</td></tr>
+  <tr><td>2</td><td><code>artist_id.inverted_index</code></td><td>dictionary id → bitmap of matching docIds (19,225 of them; <code>LIMIT 100</code> takes the first 100)</td><td>16.4 MB</td></tr>
+  <tr><td>3</td><td>19 × <code>&lt;column&gt;.forward_index</code></td><td>docId → dictionary id, for each selected column</td><td>1–7 MB each</td></tr>
+  <tr><td>4</td><td>19 × <code>&lt;column&gt;.dictionary</code></td><td>dictionary id → the actual value to return</td><td>up to 390 MB (<code>song_name_arabic</code>)</td></tr>
+</table>
+
+<h4>Step 5 — measured result</h4>
+<div class="measured">
+<pre><code>rows returned         100
+numDocsScanned        100          ← the index worked: 100 of 5,153,926 rows examined
+numSegmentsMatched    1            ← pruning worked: 1 of 2 segments
+exceptions            []
+timeUsedMs            1804 – 2930  (three consecutive runs: 2930, 2201, 1804)
+
+S3 requests during one run:  274 GetObject calls, e.g.
+   Range: bytes=17419741-17613962
+   Range: bytes=17613971-19607354
+   Range: bytes=25642062-43001150
+
+Server disk after the query:  76 KB   (unchanged — nothing was cached)</code></pre>
+</div>
+
+<div class="box">
+<strong>Reading the result.</strong> Identification is surgical — 100 documents out of 5.15 million, one segment
+of two. Fetching is not: roughly 580 MB of dictionaries and forward indexes crossed the wire to produce 100
+rows, because the unit of I/O is the index entry, not the row. Closing that gap is the main open item (§10).
+</div>
+
+<h2 id="index"><span class="n">6.</span>What happens when the column has no index</h2>
+<p>
+This table has an inverted index on <code>artist_id</code>, <code>country_code</code> and <code>owner_id</code>,
+and bloom filters on <code>artist_id</code> and <code>song_id</code>. Nothing on <code>album_id</code> or
+<code>song_name</code>. The difference is visible in Pinot's own counters:
+</p>
+<table>
+  <tr><th>Query</th><th>Filter path</th><th><code>entriesScannedInFilter</code></th><th><code>docsScanned</code></th><th>Time</th><th>S3 GETs</th></tr>
+  <tr>
+    <td><code>WHERE artist_id = 72</code></td>
+    <td class="good">inverted index</td>
+    <td><span class="good">0</span></td><td>19,225</td><td>75–104 ms</td><td>28</td>
+  </tr>
+  <tr>
+    <td><code>WHERE album_id = 1009478870</code></td>
+    <td class="bad">full column scan</td>
+    <td><span class="bad">5,153,926</span></td><td>4</td><td>81–118 ms</td><td>22</td>
+  </tr>
+  <tr>
+    <td><code>WHERE song_name = 'Amarain'</code></td>
+    <td class="bad">full column scan</td>
+    <td><span class="bad">5,153,926</span></td><td>162</td><td>202 ms</td><td>—</td>
+  </tr>
+</table>
+
+<h4>What actually differs</h4>
+<ul>
+  <li><strong>With an index:</strong> read the dictionary (find the value's id), read that id's bitmap from the
+      inverted index, and you have the exact docIds. <code>entriesScannedInFilter = 0</code> — no rows were
+      examined to evaluate the predicate.</li>
+  <li><strong>Without an index:</strong> Pinot must read the column's <em>entire</em> forward index and compare
+      every value. <code>entriesScannedInFilter = 5,153,926</code> — every row. Remotely, that means the whole
+      forward index must cross the network, not just the part covering matching rows.</li>
+</ul>
+
+<div class="box">
+<strong>Why the wall-clock times look similar here — and why that is misleading.</strong> The scan of
+<code>album_id</code> is only 81–118 ms because its forward index is a dense, dictionary-encoded integer
+column of about 6 MB: cheap to transfer and fast to scan. The gap widens sharply with column width and
+cardinality — the same scan over <code>song_name_arabic</code> would mean pulling a 390 MB dictionary plus the
+forward index. Also note both queries issue a similar number of GETs (28 vs 22): request count follows the
+number of index entries touched, while <em>bytes</em> follow whether a scan was needed. On real S3, where each
+request costs 10–30 ms of latency, the unindexed path degrades much faster than these local-MinIO numbers
+suggest.
+</div>
+
+<div class="warn">
+<strong>Practical rule for remote tables:</strong> an index that only saved CPU on a local table now also saves
+<em>network transfer</em>. Columns used in filters should be indexed far more aggressively than for local
+tables; scanning is no longer merely slower, it is billable.
+</div>
+
+<h2 id="numbers"><span class="n">7.</span>Measured performance</h2>
+<p>
+Table: <code>artist_dashboard_daily_streams_aggregated</code>, 2 daily partitions from
+<code>s3://anghami-processed-data/dwh/</code>, 5,153,926 rows, 19 columns, 2.0 GB of segment data in MinIO.
+Server: 4 GB heap, no local cache. Three consecutive runs of each query.
+</p>
+<table>
+  <tr><th>Query</th><th>Run 1</th><th>Run 2</th><th>Run 3</th><th>Rows scanned</th></tr>
+  <tr><td><code>SELECT COUNT(*)</code></td><td>289 ms</td><td>6 ms</td><td>8 ms</td><td>5,153,926 (metadata)</td></tr>
+  <tr><td><code>COUNT(*) WHERE artist_id = 72</code></td><td>340 ms</td><td>109 ms</td><td>94 ms</td><td>19,225</td></tr>
+  <tr><td><code>SELECT * WHERE artist_id = 72 LIMIT 100</code></td><td>2,930 ms</td><td>2,201 ms</td><td>1,804 ms</td><td>100</td></tr>
+  <tr><td><code>GROUP BY country_code</code></td><td>274 ms</td><td>123 ms</td><td>143 ms</td><td>5,153,926</td></tr>
+  <tr><td><code>GROUP BY artist_name</code></td><td>1,271 ms</td><td>601 ms</td><td>767 ms</td><td>5,153,926</td></tr>
+  <tr><td><code>SELECT * LIMIT 10</code></td><td>1,250 ms</td><td>1,086 ms</td><td>1,683 ms</td><td>10</td></tr>
+</table>
+<p>
+Zero exceptions in every run. Two observations matter more than the absolute numbers:
+</p>
+<ul>
+  <li><strong>The times do not converge toward zero.</strong> With caching enabled the second run of
+      <code>SELECT *</code> was 52 ms; here it stays around 2 s. Repeatedly slow is the signature of genuinely
+      re-reading the object store each time.</li>
+  <li><strong>Cost tracks columns touched, not rows.</strong> A group-by over all 5.15 M rows on one narrow
+      column (<code>country_code</code>) costs ~130 ms; a 100-row <code>SELECT *</code> costs ~2 s, because it
+      must pull 19 dictionaries.</li>
+</ul>
+<div class="warn">
+<strong>Caveat on absolute numbers:</strong> MinIO here runs on localhost — no network latency, no per-request
+charge. Real S3 adds roughly 10–30 ms of first-byte latency per GET. Query shapes that issue many small reads
+(<code>SELECT *</code>, unindexed scans) will degrade considerably more than shapes that issue a few large
+reads. Treat these figures as a lower bound.
+</div>
+
+<h2 id="proof"><span class="n">8.</span>How to prove it is really reading S3</h2>
+
+<h4>a. Watch the requests</h4>
+<pre><code>docker run --rm --network docker_pinotnet --entrypoint sh \
+  quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z \
+  -c 'mc alias set l http://minio:9000 pinotaccess pinotsecret >/dev/null; mc admin trace --verbose l' > trace.log
+# run the query, then
+grep -c GetObject trace.log                       # → 274
+grep -oE "Range: bytes=[0-9]+-[0-9]+" trace.log   # → Range: bytes=17419741-17613962 …</code></pre>
+
+<h4>b. Stop the deep store — the query must fail</h4>
+<pre><code>docker stop pinot-minio && &lt;run query&gt;
+
+rows returned: 0
+exception:     Failed ranged read of artist_id.bloom_filter [0, +194222)
+               for segment: artist_dashboard_daily_streams_aggregated_OFFLINE_2026-08-04…</code></pre>
+<p>
+This is the decisive test: if any of the data were resident locally, the query would have succeeded. It failed
+on the very first read. After restarting MinIO the query recovers on its own — though the first attempt after
+recovery fails on stale pooled connections, then succeeds (1,867 ms, 1,736 ms).
+</p>
+
+<h4>c. Inspect the disk</h4>
+<pre><code>docker exec pinot-server du -sh /tmp/pinot/server/data /tmp/pinot/remote-cache
+  76K   /tmp/pinot/server/data      ← metadata only
+  (none) /tmp/pinot/remote-cache    ← caching disabled
+
+docker exec pinot-server sh -c 'ls /tmp/pinot/server/data/*/*/v3/columns.psf | wc -l'
+  0</code></pre>
+
+<h4>d. Watch memory settle</h4>
+<pre><code>docker exec pinot-server jcmd 1 GC.run; docker exec pinot-server jcmd 1 GC.heap_info
+  garbage-first heap  total 2840576K, used 839880K</code></pre>
+<p>Heap returns to a baseline between queries rather than growing — entries are released when the query ends.</p>
+
+<h2 id="config"><span class="n">9.</span>Configuration reference</h2>
+
+<h4>Table (OFFLINE only)</h4>
+<pre><code>"metadata": {
+  "customConfigs": {
+    "remote.query.enabled":  "true",
+    "remote.query.base.uri": "s3://my-bucket/pinot-deepstore/myTable/"
+  }
+}</code></pre>
+<div class="warn">
+The key is <code>metadata</code>, not <code>customConfigs</code>, at the top level of the table config — Pinot's
+JSON name for <code>TableCustomConfig</code> is <code>metadata</code>. Getting this wrong is silent: the table is
+created successfully and simply behaves as a normal table.
+</div>
+
+<h4>Deep-store layout</h4>
+<p>
+Segments must be published <strong>untarred</strong>, because a <code>.tar.gz</code> cannot be range-read:
+</p>
+<pre><code>s3://bucket/pinot-deepstore/myTable/&lt;segmentName&gt;/v3/
+    columns.psf            ← read by ranged GET at query time
+    metadata.properties    ← fetched once at segment load
+    index_map              ← fetched once at segment load
+    creation.meta          ← fetched once at segment load</code></pre>
+
+<h4>Server</h4>
+<pre><code># server config file
+pinot.server.instance.segment.directory.loader=remote   # non-remote tables delegate to the default loader
+pinot.server.query.executor.enable.prefetch=true        # upstream flag; drives the fetch planner
+
+# JVM system properties
+-Dpinot.server.instance.remote.cache.enabled=false          # ← the mode used in this document
+-Dpinot.server.instance.remote.query.max.fetch.bytes=1G     # per-query admission budget
+-Dpinot.server.instance.remote.promote.max.bytes=128M       # larger entries are read in ranges
+-Dpinot.server.instance.remote.fetch.parallelism=8
+-Dpinot.server.instance.remote.fetch.timeout.seconds=30
+-Dpinot.server.instance.remote.coalesce.gap.bytes=256K</code></pre>
+
+<h4>The optional disk cache (not used above)</h4>
+<p>
+Setting <code>remote.cache.enabled=true</code> streams each fetched entry to a local file and
+<code>mmap</code>s it, bounded by <code>remote.cache.max.bytes</code> with LRU eviction. It changes the
+performance profile completely — the same <code>SELECT *</code> measured 1,359 ms cold and
+<strong>52 ms warm</strong> — at the cost of local disk. It is described here only for completeness; every
+number elsewhere in this document is from the cache-disabled configuration.
+</p>
+
+<h2 id="limits"><span class="n">10.</span>Limits, known gaps, and what comes next</h2>
+
+<h4>Design limits inherent to the approach</h4>
+<ul>
+  <li><strong>The deep store is a hard dependency.</strong> If it is unavailable, remote tables cannot serve
+      queries at all.</li>
+  <li><strong>Cold latency is the trade.</strong> Every query pays deep-store cost in this mode; there is no
+      configuration that makes a remote read as fast as a local one.</li>
+  <li><strong>OFFLINE tables only.</strong> REALTIME, upsert, and dedup tables need local segments.</li>
+</ul>
+
+<h4>Implementation gaps (tracked, not yet fixed)</h4>
+<ul>
+  <li><strong>Fetch granularity is the entry, not the document.</strong> A 100-row result pulled ~580 MB. An
+      implementation that fetched only the pages holding those docIds would need on the order of 1 MB — roughly
+      two orders of magnitude better. The blocker is not the reader, which already supports ranged reads, but
+      the planner: it must pass query selectivity so prefetch can choose "coalesced ranges" for a selective
+      filter and "bulk fetch" for a scan. Measured evidence for why this must be selectivity-driven rather than
+      size-driven: with a 32 MB promote ceiling the selective query improved from 622 MB / 7.1 s to 217 MB /
+      2.4 s, while a cold group-by regressed from ~1.1 s to a timeout.</li>
+  <li><strong>Ranged reads bypass the disk cache</strong> when it is enabled — the largest entries, which are
+      the most expensive to fetch, are the ones never cached.</li>
+  <li><strong>No metrics.</strong> The counters exist in code (fetch count and bytes, cache hits/misses,
+      sync-misses, degraded fetches) but are not exposed through <code>ServerMetrics</code>, so today's
+      verification is manual (§8).</li>
+  <li><strong>Cache invalidation is not wired</strong> to segment delete or refresh; CRC keying keeps this
+      correct but leaks space until eviction.</li>
+  <li><strong>Star-tree and text indexes</strong> are not served remotely; entries above 2 GB are rejected.</li>
+  <li><strong>Reload/refresh of a remote segment</strong> is unsupported — the directory is read-only.</li>
+</ul>
+
+<h4>Operational notes learned while building this</h4>
+<ul>
+  <li>The container's IP is part of a Pinot server's Helix identity; recreating a container gives it a new
+      identity and orphans its segment assignments. The compose file pins a static IP for this reason.</li>
+  <li><code>docker compose down</code> destroys MinIO data unless a named volume is declared.</li>
+  <li>Deleting the cache directory under a running server used to break every subsequent query; the cache now
+      recreates its directory on demand.</li>
+</ul>
+
+<h2 id="run"><span class="n">11.</span>Running it yourself</h2>
+<pre><code># 1. build the launcher jar from the fork
+cd ~/Desktop/pinot-s3/pinot
+JAVA_HOME=&lt;jdk21+&gt; ./mvnw -q -pl pinot-tools -am -DskipTests install
+
+# 2. build the image (the jar plus a launcher script with the required --add-opens flags)
+cp pinot-tools/target/pinot-tool-launcher-jar-with-dependencies.jar /tmp/pinot-img/pinot-all.jar
+cd /tmp/pinot-img && docker build -t pinot-s3-query:local .
+
+# 3. start MinIO + ZooKeeper + controller + broker + server
+cd ~/Desktop/pinot-s3/docker && docker compose up -d
+
+# 4. create the table and publish segments untarred to MinIO, then register them
+curl -X POST -H 'Content-Type: application/json' --data-binary @adsa-schema.json http://localhost:9000/schemas
+curl -X POST -H 'Content-Type: application/json' --data-binary @adsa-table.json  http://localhost:9000/tables
+#   (upload each segment's v3/ directory to s3://pinot-deepstore/&lt;table&gt;/&lt;segment&gt;/v3/,
+#    then POST the segment tar to /v2/segments so Helix assigns it)
+
+# 5. run the benchmark used for §7
+./poc-s3-only.sh 3</code></pre>
+<p>Useful endpoints: broker <code>localhost:8099</code>, controller <code>localhost:9000</code>,
+MinIO console <code>localhost:9101</code> (<code>pinotaccess</code> / <code>pinotsecret</code>).</p>
+
+<footer>
+  Pinot Direct S3 Querying · fork <code>hashbro14/pinot</code>, branch
+  <code>feature/remote-segment-reads</code> · measurements taken 2026-08-06 against
+  <code>artist_dashboard_daily_streams_aggregated</code> (5,153,926 rows, 2 segments, 2.0 GB) with the local
+  cache disabled.
+</footer>
+
+</div>
+</body>
+</html>

@@ -53,11 +53,89 @@ public class RemoteQueryConfigs {
   public static final String INSTANCE_FETCH_PARALLELISM = "remote.fetch.parallelism";
   public static final String INSTANCE_FETCH_TIMEOUT_SECONDS = "remote.fetch.timeout.seconds";
   public static final String INSTANCE_COALESCE_GAP_BYTES = "remote.coalesce.gap.bytes";
+  /** Largest index entry fetched whole; bigger entries are read in ranges on demand. */
+  public static final String INSTANCE_PROMOTE_MAX_BYTES = "remote.promote.max.bytes";
+  /**
+   * Set false to bypass the disk cache entirely: every query re-reads its bytes from the deep store, so
+   * measurements reflect deep-store cost with no local reuse. Intended for benchmarking, not production.
+   */
+  public static final String INSTANCE_CACHE_ENABLED = "remote.cache.enabled";
+  /**
+   * How fetched index entries are held: {@code spill} (default) writes them to a local file, memory-maps it
+   * and unlinks it immediately, so the JVM heap stays flat and the space is reclaimed the moment the query
+   * releases the mapping; {@code cache} keeps the files for reuse across queries (LRU, bounded);
+   * {@code heap} keeps entries on the JVM heap and never touches disk.
+   */
+  public static final String INSTANCE_STORAGE_MODE = "remote.storage.mode";
 
   public static final long DEFAULT_MAX_FETCH_BYTES_PER_QUERY = 1L << 30; // 1 GB
   public static final int DEFAULT_FETCH_PARALLELISM = 8;
   public static final int DEFAULT_FETCH_TIMEOUT_SECONDS = 30;
   public static final long DEFAULT_COALESCE_GAP_BYTES = 256 * 1024;
+  /**
+   * Default ceiling for fetching an index entry whole. Above it, ranged reads win decisively: on a real
+   * table a large string dictionary (390 MB) was being pulled in full to decode a 100-row result.
+   */
+  public static final long DEFAULT_PROMOTE_MAX_BYTES = 32L << 20;
+
+  /**
+   * Per-query budget for bytes made resident by prefetch. Overridable with the
+   * {@code pinot.server.instance.remote.query.max.fetch.bytes} system property; a query planning more than
+   * this is served with ranged reads instead of being materialized.
+   */
+  public static long maxFetchBytesPerQuery() {
+    return longProperty(INSTANCE_MAX_FETCH_BYTES_PER_QUERY, DEFAULT_MAX_FETCH_BYTES_PER_QUERY);
+  }
+
+  /** How fetched entries are held for the duration of a query. */
+  public enum StorageMode {
+    /** Spill to a local file, mmap it, unlink at once: flat heap, space reclaimed when the query ends. */
+    SPILL,
+    /** Keep entry files for reuse across queries, bounded by a byte budget with LRU eviction. */
+    CACHE,
+    /** Keep entries on the JVM heap; nothing is written to disk. */
+    HEAP
+  }
+
+  public static StorageMode storageMode() {
+    String mode = System.getProperty("pinot.server.instance." + INSTANCE_STORAGE_MODE);
+    if (mode != null) {
+      try {
+        return StorageMode.valueOf(mode.trim().toUpperCase(java.util.Locale.ROOT));
+      } catch (IllegalArgumentException e) {
+        return StorageMode.SPILL;
+      }
+    }
+    // Backwards compatibility with the older boolean flag
+    String cacheEnabled = System.getProperty("pinot.server.instance." + INSTANCE_CACHE_ENABLED);
+    if (cacheEnabled != null) {
+      return Boolean.parseBoolean(cacheEnabled.trim()) ? StorageMode.CACHE : StorageMode.HEAP;
+    }
+    return StorageMode.SPILL;
+  }
+
+  /** False disables the disk cache so every query fetches from the deep store (benchmark mode). */
+  public static boolean diskCacheEnabled() {
+    String override = System.getProperty("pinot.server.instance." + INSTANCE_CACHE_ENABLED);
+    return override == null || Boolean.parseBoolean(override.trim());
+  }
+
+  /** Largest index entry fetched whole; overridable with the matching system property. */
+  public static long promoteMaxBytes() {
+    return longProperty(INSTANCE_PROMOTE_MAX_BYTES, DEFAULT_PROMOTE_MAX_BYTES);
+  }
+
+  private static long longProperty(String key, long defaultValue) {
+    String override = System.getProperty("pinot.server.instance." + key);
+    if (override != null) {
+      try {
+        return Long.parseLong(override.trim());
+      } catch (NumberFormatException e) {
+        return defaultValue;
+      }
+    }
+    return defaultValue;
+  }
 
   private final URI _baseUri;
 
@@ -93,6 +171,13 @@ public class RemoteQueryConfigs {
     }
     if (!Boolean.parseBoolean(customConfig.getCustomConfigs().get(TABLE_REMOTE_QUERY_ENABLED))) {
       return null;
+    }
+    // Dimension tables are replicated to every server and read locally for lookup/broadcast joins; serving
+    // them from the deep store would make every join stream them out of object storage.
+    if (tableConfig.isDimTable()) {
+      throw new IllegalStateException(
+          "Table " + tableConfig.getTableName() + " is a dimension table and cannot enable "
+              + TABLE_REMOTE_QUERY_ENABLED + ": dimension tables must be stored locally on every server");
     }
     String baseUri = customConfig.getCustomConfigs().get(TABLE_REMOTE_QUERY_BASE_URI);
     if (baseUri == null || baseUri.isEmpty()) {

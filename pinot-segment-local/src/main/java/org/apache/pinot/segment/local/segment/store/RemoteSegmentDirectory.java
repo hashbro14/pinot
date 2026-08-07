@@ -62,6 +62,10 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   private final RemoteSegmentMetadata _metadata;
   private final RemoteIndexFetcher _fetcher;
+  /** Per-query ceiling on bytes made resident by prefetch; beyond it the query reads lazily instead. */
+  private final long _maxFetchBytesPerQuery;
+  /** Largest single index entry that a query-mode miss may promote wholesale. */
+  private final long _maxPromoteBytes;
 
   /** Entries currently resident in memory, keyed by index entry. */
   private final ConcurrentHashMap<IndexKey, ResidentEntry> _resident = new ConcurrentHashMap<>();
@@ -75,6 +79,7 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
   private final Set<UUID> _acquiredContexts = ConcurrentHashMap.newKeySet();
   private final AtomicInteger _activeContexts = new AtomicInteger();
   private final AtomicInteger _syncMisses = new AtomicInteger();
+  private final AtomicInteger _degradedFetches = new AtomicInteger();
 
   private volatile String _tier;
 
@@ -88,8 +93,25 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
   }
 
   public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher) {
+    this(metadata, fetcher, RemoteQueryConfigs.DEFAULT_MAX_FETCH_BYTES_PER_QUERY);
+  }
+
+  public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher,
+      long maxFetchBytesPerQuery) {
+    this(metadata, fetcher, maxFetchBytesPerQuery, RemoteQueryConfigs.promoteMaxBytes());
+  }
+
+  public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher,
+      long maxFetchBytesPerQuery, long maxPromoteBytes) {
     _metadata = metadata;
     _fetcher = fetcher;
+    _maxFetchBytesPerQuery = maxFetchBytesPerQuery;
+    _maxPromoteBytes = maxPromoteBytes;
+  }
+
+  /** Largest index entry a query-mode miss may promote wholesale; bigger entries are read in ranges. */
+  long getMaxPromoteBytes() {
+    return _maxPromoteBytes;
   }
 
   @Override
@@ -142,8 +164,38 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   @Override
   public void prefetch(FetchContext fetchContext) {
+    List<IndexKey> planned = plannedKeys(fetchContext);
+    long plannedBytes = 0;
+    for (IndexKey key : planned) {
+      plannedBytes += indexRange(key).getDataSize();
+    }
+    // Admission control: a query that would make more than the budget resident (e.g. SELECT * over
+    // every column) is served lazily by ranged reads instead of being materialized. Memory stays
+    // bounded; the query is slower but correct, and never takes the server down.
+    if (plannedBytes > _maxFetchBytesPerQuery) {
+      _degradedFetches.incrementAndGet();
+      LOGGER.warn("Prefetch of {} bytes across {} index entries exceeds the per-query budget of {} bytes for "
+              + "segment: {}; serving this query with ranged reads instead", plannedBytes, planned.size(),
+          _maxFetchBytesPerQuery, _metadata.getSegmentName());
+      return;
+    }
     Set<IndexKey> pinned =
         _pinsByContext.computeIfAbsent(fetchContext.getFetchId(), id -> ConcurrentHashMap.newKeySet());
+    for (IndexKey key : planned) {
+      // Entries bigger than the promote ceiling are NOT pulled whole: a query that touches a few rows of a
+      // large dictionary or forward index should read only the ranges it needs, on demand.
+      if (indexRange(key).getDataSize() > _maxPromoteBytes) {
+        continue;
+      }
+      if (pinned.add(key)) {
+        pin(key);
+      }
+    }
+  }
+
+  /** Index entries this fetch context asks for, restricted to entries the segment actually has. */
+  private List<IndexKey> plannedKeys(FetchContext fetchContext) {
+    List<IndexKey> planned = new ArrayList<>();
     for (Map.Entry<String, List<IndexType<?, ?, ?>>> entry : fetchContext.getColumnToIndexList().entrySet()) {
       for (IndexKey key : _metadata.getIndexRanges().keySet()) {
         if (!key._name.equals(entry.getKey())) {
@@ -152,11 +204,10 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
         if (entry.getValue() != null && !entry.getValue().contains(key._type)) {
           continue;
         }
-        if (pinned.add(key)) {
-          pin(key);
-        }
+        planned.add(key);
       }
     }
+    return planned;
   }
 
   @Override
@@ -206,6 +257,10 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     return _syncMisses.get();
   }
 
+  int getDegradedFetches() {
+    return _degradedFetches.get();
+  }
+
   RemoteSegmentMetadata getRemoteMetadata() {
     return _metadata;
   }
@@ -224,14 +279,32 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   private void unpin(IndexKey key) {
     ResidentEntry entry = _resident.get(key);
-    if (entry != null && entry._pins.decrementAndGet() <= 0) {
-      _resident.remove(key, entry);
+    if (entry != null && entry._pins.decrementAndGet() <= 0 && _resident.remove(key, entry)) {
+      closeQuietly(entry);
+    }
+  }
+
+  /** Releases an entry's mapping; the cached file stays for the next query to map again. */
+  private static void closeQuietly(ResidentEntry entry) {
+    if (!entry._data.isDone() || entry._data.isCompletedExceptionally()) {
+      return;
+    }
+    try {
+      entry._data.join().close();
+    } catch (Exception e) {
+      LOGGER.warn("Failed to release mapped remote entry", e);
     }
   }
 
   /** Frees entries fetched by sync misses (pin count 0) once no query is active. */
   private void freeStrays() {
-    _resident.entrySet().removeIf(entry -> entry.getValue()._pins.get() <= 0);
+    _resident.entrySet().removeIf(entry -> {
+      if (entry.getValue()._pins.get() > 0) {
+        return false;
+      }
+      closeQuietly(entry.getValue());
+      return true;
+    });
   }
 
   /**
@@ -277,19 +350,34 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     }
   }
 
+  /**
+   * Materializes a whole index entry through the disk cache: the bytes are streamed from the deep store into
+   * a local file and memory-mapped, so the entry never occupies JVM heap and a later query touching the same
+   * entry is served locally.
+   */
   private PinotDataBuffer fetchWholeEntry(IndexKey key) {
     RemoteSegmentMetadata.IndexRange range = indexRange(key);
-    int dataSize = Math.toIntExact(range.getDataSize());
-    byte[] data = new byte[dataSize];
-    List<RemoteIndexFetcher.RangeRequest> requests = new ArrayList<>(1);
-    requests.add(new RemoteIndexFetcher.RangeRequest(range.getDataStartOffset(), dataSize, data, 0));
-    try {
-      _fetcher.fetchRanges(_metadata.getColumnsPsfUri(), requests);
-    } catch (IOException e) {
-      throw new RuntimeException(
-          "Failed to fetch index entry " + key + " for segment: " + _metadata.getSegmentName(), e);
+    String segmentKey = _metadata.getSegmentName() + ":" + _metadata.getCrc();
+    String entryName = key._name + "." + key._type.getId();
+    RemoteEntryDiskCache.RangeReader reader =
+        (offsetInData, target, length) -> readDataRange(key, offsetInData, target, length);
+    switch (RemoteQueryConfigs.storageMode()) {
+      case HEAP:
+        // Nothing touches disk: the entry lives on the JVM heap until the query releases it.
+        int dataSize = Math.toIntExact(range.getDataSize());
+        byte[] data = new byte[dataSize];
+        readDataRange(key, 0, data, dataSize);
+        return PinotByteBuffer.wrap(ByteBuffer.wrap(data));
+      case CACHE:
+        return RemoteEntryDiskCache.getInstance()
+            .getOrFetch(segmentKey, entryName, range.getDataSize(), reader);
+      case SPILL:
+      default:
+        // Disk-backed but query-scoped: mapped from a file that is unlinked immediately, so heap stays flat
+        // and the space is returned as soon as the query releases the mapping.
+        return RemoteEntryDiskCache.getInstance()
+            .fetchEphemeral(segmentKey, entryName, range.getDataSize(), reader);
     }
-    return PinotByteBuffer.wrap(ByteBuffer.wrap(data));
   }
 
   private RemoteSegmentMetadata.IndexRange indexRange(IndexKey key) {
@@ -340,6 +428,7 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
   @Override
   public void close()
       throws IOException {
+    _resident.values().forEach(RemoteSegmentDirectory::closeQuietly);
     _resident.clear();
     _pinsByContext.clear();
   }
