@@ -69,7 +69,14 @@ public class RemoteQueryConfigs {
   public static final String INSTANCE_STORAGE_MODE = "remote.storage.mode";
 
   public static final long DEFAULT_MAX_FETCH_BYTES_PER_QUERY = 1L << 30; // 1 GB
-  public static final int DEFAULT_FETCH_PARALLELISM = 8;
+  /**
+   * Threads available for ranged fetches.
+   *
+   * <p>Sized above the old default of 8 because a batch now submits all of its ranges at once and blocks
+   * until they land. With a small shared pool, every operator thread queues its ranges behind every other
+   * thread's while holding a thread hostage, which is slower than fetching one range at a time.
+   */
+  public static final int DEFAULT_FETCH_PARALLELISM = 32;
   public static final int DEFAULT_FETCH_TIMEOUT_SECONDS = 30;
   public static final long DEFAULT_COALESCE_GAP_BYTES = 256 * 1024;
   /**

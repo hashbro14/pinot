@@ -365,6 +365,31 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
   }
 
   /**
+   * Reads several ranges of one index entry with every range in flight at once.
+   *
+   * <p>Ranges are taken as already merged, so each becomes exactly one GET. Against object storage the
+   * request count matters far less than whether the requests wait on each other: twenty concurrent ranged
+   * reads cost about one round trip, twenty serial ones cost twenty.
+   */
+  void readDataRanges(IndexKey key, List<long[]> ranges, List<byte[]> targets) {
+    RemoteSegmentMetadata.IndexRange range = indexRange(key);
+    List<RemoteIndexFetcher.RangeRequest> requests = new ArrayList<>(ranges.size());
+    for (int i = 0; i < ranges.size(); i++) {
+      byte[] target = targets.get(i);
+      requests.add(
+          new RemoteIndexFetcher.RangeRequest(range.getDataStartOffset() + ranges.get(i)[0], target.length, target,
+              0));
+    }
+    try {
+      _fetcher.fetchRanges(_metadata.getColumnsPsfUri(), requests, 0);
+    } catch (IOException e) {
+      throw new RuntimeException(
+          "Failed batched ranged read of " + key + " (" + ranges.size() + " ranges) for segment: "
+              + _metadata.getSegmentName(), e);
+    }
+  }
+
+  /**
    * Materializes a whole index entry through the disk cache: the bytes are streamed from the deep store into
    * a local file and memory-mapped, so the entry never occupies JVM heap and a later query touching the same
    * entry is served locally.

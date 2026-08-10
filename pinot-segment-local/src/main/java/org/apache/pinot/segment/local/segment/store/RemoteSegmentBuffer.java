@@ -380,6 +380,8 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
       // batch too scattered to merge). Decline; the promote-on-miss path pulls it in one bounded read.
       return;
     }
+    List<long[]> toFetch = new ArrayList<>(merged.size());
+    List<byte[]> targets = new ArrayList<>(merged.size());
     for (long[] range : merged) {
       long start = range[0];
       int len = Math.toIntExact(Math.min(range[1] - start, _size - start));
@@ -392,10 +394,18 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
           continue;
         }
       }
-      byte[] fetched = new byte[len];
-      _rangeFetches.incrementAndGet();
-      _directory.readDataRange(_key, _baseOffset + start, fetched, len);
-      cacheSubRange(start, fetched);
+      // element 0 is the offset to read, element 1 the key this range is cached under
+      toFetch.add(new long[]{_baseOffset + start, start});
+      targets.add(new byte[len]);
+    }
+    if (toFetch.isEmpty()) {
+      return;
+    }
+    // One call, so the batch's ranges are all in flight together rather than each waiting its turn
+    _rangeFetches.addAndGet(toFetch.size());
+    _directory.readDataRanges(_key, toFetch, targets);
+    for (int i = 0; i < toFetch.size(); i++) {
+      cacheSubRange(toFetch.get(i)[1], targets.get(i));
     }
   }
 

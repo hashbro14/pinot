@@ -119,6 +119,15 @@ public class RemoteIndexFetcher {
    */
   public void fetchRanges(URI fileUri, List<RangeRequest> requests)
       throws IOException {
+    fetchRanges(fileUri, requests, _coalesceGapBytes);
+  }
+
+  /**
+   * Same, with an explicit coalesce distance. A caller that has already merged its ranges passes 0, so the
+   * groups here are exactly the GETs it planned and this call only parallelizes them.
+   */
+  public void fetchRanges(URI fileUri, List<RangeRequest> requests, long coalesceGapBytes)
+      throws IOException {
     if (requests.isEmpty()) {
       return;
     }
@@ -130,7 +139,7 @@ public class RemoteIndexFetcher {
     List<RangeRequest> current = new ArrayList<>();
     long currentEnd = -1;
     for (RangeRequest request : sorted) {
-      if (current.isEmpty() || request._offset - currentEnd <= _coalesceGapBytes) {
+      if (current.isEmpty() || request._offset - currentEnd <= coalesceGapBytes) {
         current.add(request);
       } else {
         groups.add(current);
