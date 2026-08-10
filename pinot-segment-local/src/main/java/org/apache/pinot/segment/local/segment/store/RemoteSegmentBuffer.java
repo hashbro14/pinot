@@ -25,12 +25,12 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Lazy {@link PinotDataBuffer} over (a range of) one index entry of a remote segment's {@code columns.psf}.
