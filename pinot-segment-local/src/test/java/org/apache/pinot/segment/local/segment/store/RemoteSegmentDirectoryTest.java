@@ -103,7 +103,7 @@ public class RemoteSegmentDirectoryTest {
 
     _remoteMetadata = new RemoteSegmentMetadata(SEGMENT_NAME, "12345", _segmentBaseDir.toURI(),
         RemoteSegmentMetadata.columnsPsfUri(_segmentBaseDir.toURI()), ranges,
-        ColumnIndexDirectoryTestHelper.writeMetadata(SegmentVersion.v3), _segmentBaseDir);
+        ColumnIndexDirectoryTestHelper.writeMetadata(SegmentVersion.v3), _segmentBaseDir, null);
     // Eager prefetching is off in production but is what the acquire/release lifecycle tests exercise
     _directory = new RemoteSegmentDirectory(_remoteMetadata,
         new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30),

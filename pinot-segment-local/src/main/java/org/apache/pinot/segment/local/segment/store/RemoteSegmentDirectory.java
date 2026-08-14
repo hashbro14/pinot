@@ -47,7 +47,8 @@ import org.slf4j.LoggerFactory;
  * Read-only {@link SegmentDirectory} whose data lives entirely in the deep store: index buffers are fetched
  * from {@code columns.psf} via ranged reads at query time and held only in memory, only for the duration of
  * the queries that need them. Nothing is persisted locally except the KB-sized metadata files handled by
- * {@link RemoteSegmentRegistry}.
+ * {@link RemoteSegmentRegistry} — plus the segment's star-tree files when it has any, which live outside
+ * {@code columns.psf} and are served memory-mapped from the same local scratch directory.
  *
  * <p>Lifecycle per query: {@link #prefetch} starts async fetches of the query's index entries and pins them,
  * {@link #acquire} blocks until the pinned entries are resident, {@link #release} unpins them — an entry whose
@@ -63,6 +64,13 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   private final RemoteSegmentMetadata _metadata;
   private final RemoteIndexFetcher _fetcher;
+  /**
+   * Serves star-tree buffers, shared with (and owned by) the registry entry — see
+   * {@link RemoteSegmentMetadata#getStarTreeIndexReader()}. Null when the segment has no star-trees or they
+   * could not be loaded — queries then fall back to raw scans.
+   */
+  @Nullable
+  private final StarTreeIndexReader _starTreeIndexReader;
   /** Per-query ceiling on bytes made resident by prefetch; beyond it the query reads lazily instead. */
   private final long _maxFetchBytesPerQuery;
   /** Largest single index entry that a query-mode miss may promote wholesale. */
@@ -115,6 +123,7 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     _fetcher = fetcher;
     _maxFetchBytesPerQuery = maxFetchBytesPerQuery;
     _maxPromoteBytes = maxPromoteBytes;
+    _starTreeIndexReader = metadata.getStarTreeIndexReader();
   }
 
   /** Largest index entry a query-mode miss may promote wholesale; bigger entries are read in ranges. */
@@ -444,6 +453,36 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
       }
 
       @Override
+      public boolean hasStarTreeIndex() {
+        return _starTreeIndexReader != null;
+      }
+
+      @Override
+      public Reader getStarTreeIndexReader(int starTreeId) {
+        return new Reader() {
+          @Override
+          public PinotDataBuffer getIndexFor(String column, IndexType<?, ?, ?> type)
+              throws IOException {
+            return _starTreeIndexReader.getBuffer(starTreeId, column, type);
+          }
+
+          @Override
+          public boolean hasIndexFor(String column, IndexType<?, ?, ?> type) {
+            return _starTreeIndexReader.hasIndexFor(starTreeId, column, type);
+          }
+
+          @Override
+          public void close() {
+          }
+
+          @Override
+          public String toString() {
+            return _starTreeIndexReader + " for " + starTreeId;
+          }
+        };
+      }
+
+      @Override
       public void close() {
       }
 
@@ -470,5 +509,7 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     _resident.values().forEach(RemoteSegmentDirectory::closeQuietly);
     _resident.clear();
     _pinsByContext.clear();
+    // The star-tree reader is owned by the registry entry (shared across reloads of this segment) and is
+    // closed on entry removal, not here.
   }
 }

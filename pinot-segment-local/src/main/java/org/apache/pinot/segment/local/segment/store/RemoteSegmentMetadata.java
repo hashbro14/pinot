@@ -22,6 +22,7 @@ import java.io.File;
 import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
+import javax.annotation.Nullable;
 import org.apache.commons.configuration2.PropertiesConfiguration;
 import org.apache.pinot.segment.spi.V1Constants;
 import org.apache.pinot.segment.spi.index.metadata.SegmentMetadataImpl;
@@ -79,9 +80,18 @@ public class RemoteSegmentMetadata {
   private final SegmentMetadataImpl _segmentMetadata;
   private final File _localMetadataDir;
   private final long _totalIndexBytes;
+  /**
+   * Reader over the segment's star-tree files, opened once at registration (the files are materialized
+   * locally then memory-mapped, so it stays valid even after the scratch files are replaced or deleted).
+   * Owned by the registry entry: closed when the entry is removed, never by the segment directories that
+   * share it. Null when the segment has no star-trees or they could not be loaded.
+   */
+  @Nullable
+  private final StarTreeIndexReader _starTreeIndexReader;
 
   public RemoteSegmentMetadata(String segmentName, String crc, URI segmentBaseUri, URI columnsPsfUri,
-      Map<IndexKey, IndexRange> indexRanges, SegmentMetadataImpl segmentMetadata, File localMetadataDir) {
+      Map<IndexKey, IndexRange> indexRanges, SegmentMetadataImpl segmentMetadata, File localMetadataDir,
+      @Nullable StarTreeIndexReader starTreeIndexReader) {
     _segmentName = segmentName;
     _crc = crc;
     _segmentBaseUri = segmentBaseUri;
@@ -90,6 +100,12 @@ public class RemoteSegmentMetadata {
     _segmentMetadata = segmentMetadata;
     _localMetadataDir = localMetadataDir;
     _totalIndexBytes = indexRanges.values().stream().mapToLong(IndexRange::getSize).sum();
+    _starTreeIndexReader = starTreeIndexReader;
+  }
+
+  @Nullable
+  public StarTreeIndexReader getStarTreeIndexReader() {
+    return _starTreeIndexReader;
   }
 
   public String getSegmentName() {
