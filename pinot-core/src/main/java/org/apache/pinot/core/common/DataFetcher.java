@@ -20,11 +20,14 @@ package org.apache.pinot.core.common;
 
 import com.google.common.base.Preconditions;
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 import org.apache.pinot.core.plan.DocIdSetPlanNode;
+import org.apache.pinot.segment.local.segment.store.RemoteQueryConfigs;
 import org.apache.pinot.segment.spi.datasource.DataSource;
 import org.apache.pinot.segment.spi.datasource.DataSourceMetadata;
 import org.apache.pinot.segment.spi.index.reader.Dictionary;
@@ -46,6 +49,8 @@ public class DataFetcher implements AutoCloseable {
   // Thread local (reusable) buffer for single-valued column dictionary Ids
   private static final ThreadLocal<int[]> THREAD_LOCAL_DICT_IDS =
       ThreadLocal.withInitial(() -> new int[DocIdSetPlanNode.MAX_DOC_PER_CALL]);
+  // Whether projections hint all columns of a block before reading them; see RemoteQueryConfigs
+  private static final boolean PIPELINED_HINTS = RemoteQueryConfigs.pipelinedHintsEnabled();
 
   // TODO: Figure out a way to close the reader context within the ColumnValueReader
   //       ChunkReaderContext should be closed explicitly to release the off-heap buffer
@@ -87,6 +92,37 @@ public class DataFetcher implements AutoCloseable {
     Dictionary dictionary = forwardIndexReader.isDictionaryEncoded() ? dataSource.getDictionary() : null;
     ColumnValueReader columnValueReader = new ColumnValueReader(forwardIndexReader, dictionary);
     _columnValueReaderMap.put(column, columnValueReader);
+  }
+
+  /**
+   * Hints every column's forward index that the given document ids are about to be read. Issued once per
+   * block, before any column is read, so a forward index backed by remote storage can put the ranges of all
+   * columns in flight together; a no-op for local readers.
+   *
+   * @param docIds Document ids of the block
+   * @param length Number of document ids
+   */
+  public void prefetch(int[] docIds, int length) {
+    if (!PIPELINED_HINTS) {
+      return;
+    }
+    // Stage 1: every forward index at once (one round trip for the block). Stage 2: for the columns that took
+    // the hint, decode the block's dictionary ids — now local — and hint every dictionary at once (a second
+    // round trip). The reads that follow, column by column, find both stages' bytes already there.
+    List<ColumnValueReader> hinted = null;
+    for (ColumnValueReader reader : _columnValueReaderMap.values()) {
+      if (reader.prefetchForward(docIds, length)) {
+        if (hinted == null) {
+          hinted = new ArrayList<>();
+        }
+        hinted.add(reader);
+      }
+    }
+    if (hinted != null) {
+      for (ColumnValueReader reader : hinted) {
+        reader.prefetchDictionary(docIds, length);
+      }
+    }
   }
 
   /**
@@ -346,6 +382,21 @@ public class DataFetcher implements AutoCloseable {
         _readerContextCreated = true;
       }
       return _readerContext;
+    }
+
+    /** Hints the forward index; true when it is remote-backed and the dictionary stage is worth running. */
+    boolean prefetchForward(int[] docIds, int length) {
+      return _reader.prefetch(docIds, length, getReaderContext());
+    }
+
+    /** Decodes the block's dictionary ids (local after stage 1) and hints the dictionary with them. */
+    void prefetchDictionary(int[] docIds, int length) {
+      if (_dictionary == null || !_singleValue) {
+        return;
+      }
+      int[] dictIdBuffer = THREAD_LOCAL_DICT_IDS.get();
+      _reader.readDictIds(docIds, length, dictIdBuffer, getReaderContext());
+      _dictionary.prefetch(dictIdBuffer, length);
     }
 
     void readDictIds(int[] docIds, int length, int[] dictIdBuffer) {

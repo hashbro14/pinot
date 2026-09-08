@@ -28,6 +28,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.annotation.Nullable;
 import org.apache.pinot.spi.filesystem.PinotFS;
 import org.apache.pinot.spi.filesystem.PinotFSFactory;
 import org.slf4j.Logger;
@@ -53,8 +54,12 @@ public class RemoteIndexFetcher {
   private final ExecutorService _coordinatorExecutor;
   private final long _coalesceGapBytes;
   private final int _fetchTimeoutSeconds;
+  /** Benchmark-only per-request delay; see {@link RemoteQueryConfigs#fetchDebugLatencyMs()}. */
+  private final long _debugLatencyMs = RemoteQueryConfigs.fetchDebugLatencyMs();
   private final AtomicLong _fetchedBytes = new AtomicLong();
   private final AtomicLong _fetchCount = new AtomicLong();
+  /** Wall time spent inside GETs, summed over requests (overlapping requests count each in full). */
+  private final AtomicLong _fetchNanos = new AtomicLong();
 
   public RemoteIndexFetcher(int parallelism, long coalesceGapBytes, int fetchTimeoutSeconds) {
     _executor = Executors.newFixedThreadPool(parallelism, runnable -> {
@@ -94,6 +99,12 @@ public class RemoteIndexFetcher {
     synchronized (RemoteIndexFetcher.class) {
       _instance = new RemoteIndexFetcher(parallelism, coalesceGapBytes, fetchTimeoutSeconds);
     }
+  }
+
+  /** The shared instance if one exists, without creating it; null on a server that never fetched remotely. */
+  @Nullable
+  public static RemoteIndexFetcher peekInstance() {
+    return _instance;
   }
 
   /** One requested byte range; {@code _target} receives exactly {@code _length} bytes on success. */
@@ -171,7 +182,11 @@ public class RemoteIndexFetcher {
       groupEnd = Math.max(groupEnd, request._offset + request._length);
     }
     int groupLength = Math.toIntExact(groupEnd - groupStart);
+    long startNanos = System.nanoTime();
     try {
+      if (_debugLatencyMs > 0) {
+        Thread.sleep(_debugLatencyMs);
+      }
       byte[] groupBuffer = new byte[groupLength];
       int read = pinotFS.readRange(fileUri, groupStart, groupBuffer, 0, groupLength);
       if (read < groupLength) {
@@ -185,9 +200,14 @@ public class RemoteIndexFetcher {
       }
       _fetchCount.incrementAndGet();
       _fetchedBytes.addAndGet(groupLength);
+      _fetchNanos.addAndGet(System.nanoTime() - startNanos);
     } catch (IOException e) {
       LOGGER.warn("Failed to fetch range [{}, {}) of {}", groupStart, groupEnd, fileUri, e);
       throw new RuntimeException(e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted while fetching range [" + groupStart + ", " + groupEnd + ") of "
+          + fileUri, e);
     }
   }
 
@@ -197,5 +217,10 @@ public class RemoteIndexFetcher {
 
   public long getFetchCount() {
     return _fetchCount.get();
+  }
+
+  /** Nanoseconds spent inside GETs, summed over requests. */
+  public long getFetchNanos() {
+    return _fetchNanos.get();
   }
 }

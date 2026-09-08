@@ -60,6 +60,16 @@ public final class FixedBitSVForwardIndexReader implements ForwardIndexReader<Fo
   }
 
   @Override
+  public boolean prefetch(int[] docIds, int length, ForwardIndexReaderContext context) {
+    if (!_reader.remoteBacked()) {
+      return false;
+    }
+    // No-op when the forward index is already local; true either way so the dictionary gets its hint
+    _reader.prefetch(docIds, length);
+    return true;
+  }
+
+  @Override
   public void readDictIds(int[] docIds, int length, int[] dictIdBuffer, ForwardIndexReaderContext context) {
     _reader.prefetch(docIds, length);
     for (int i = 0; i < length; i++) {

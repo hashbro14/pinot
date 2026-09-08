@@ -40,8 +40,10 @@ import org.slf4j.LoggerFactory;
  * <p>Tables that do not enable remote querying fall through to {@link DefaultSegmentDirectoryLoader}, so an
  * instance configured with this loader behaves exactly as today for every non-remote table.
  */
-@SegmentLoader(name = "remote")
+@SegmentLoader(name = RemoteSegmentDirectoryLoader.NAME)
 public class RemoteSegmentDirectoryLoader implements SegmentDirectoryLoader {
+  /** Value of {@code pinot.server.instance.segment.directory.loader} that selects this loader. */
+  public static final String NAME = "remote";
   private static final Logger LOGGER = LoggerFactory.getLogger(RemoteSegmentDirectoryLoader.class);
 
   private final DefaultSegmentDirectoryLoader _defaultLoader = new DefaultSegmentDirectoryLoader();

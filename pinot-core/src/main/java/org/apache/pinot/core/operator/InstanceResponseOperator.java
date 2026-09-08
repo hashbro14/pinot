@@ -26,6 +26,7 @@ import org.apache.pinot.core.operator.blocks.InstanceResponseBlock;
 import org.apache.pinot.core.operator.blocks.results.BaseResultsBlock;
 import org.apache.pinot.core.operator.combine.BaseCombineOperator;
 import org.apache.pinot.core.query.request.context.QueryContext;
+import org.apache.pinot.segment.local.segment.store.RemoteIndexFetcher;
 import org.apache.pinot.segment.spi.FetchContext;
 import org.apache.pinot.segment.spi.SegmentContext;
 import org.apache.pinot.spi.accounting.ThreadResourceSnapshot;
@@ -46,6 +47,12 @@ public class InstanceResponseOperator extends BaseOperator<InstanceResponseBlock
   protected long _threadCpuTimeNs;
   protected long _threadMemAllocatedBytes;
   protected long _systemActivitiesCpuTimeNs;
+
+  // Snapshot of the process-wide remote fetch counters taken at prefetch time, to attribute GETs to this query
+  private long _remoteFetchesBefore = -1;
+  private long _remoteBytesBefore;
+  private long _remoteFetchNanosBefore;
+  private long _remoteStartNanos;
 
   public InstanceResponseOperator(BaseCombineOperator<?> combineOperator, List<SegmentContext> segmentContexts,
       List<FetchContext> fetchContexts, QueryContext queryContext) {
@@ -147,6 +154,13 @@ public class InstanceResponseOperator extends BaseOperator<InstanceResponseBlock
   }
 
   public void prefetchAll() {
+    RemoteIndexFetcher fetcher = RemoteIndexFetcher.peekInstance();
+    if (fetcher != null) {
+      _remoteFetchesBefore = fetcher.getFetchCount();
+      _remoteBytesBefore = fetcher.getFetchedBytes();
+      _remoteFetchNanosBefore = fetcher.getFetchNanos();
+      _remoteStartNanos = System.nanoTime();
+    }
     for (int i = 0; i < _fetchContextSize; i++) {
       _segmentContexts.get(i).getIndexSegment().prefetch(_fetchContexts.get(i));
     }
@@ -156,6 +170,27 @@ public class InstanceResponseOperator extends BaseOperator<InstanceResponseBlock
     for (int i = 0; i < _fetchContextSize; i++) {
       _segmentContexts.get(i).getIndexSegment().release(_fetchContexts.get(i));
     }
+    logRemoteFetchStats();
+  }
+
+  /**
+   * Logs, at DEBUG, the remote (deep-store) GETs this query caused; exact for one query at a time, indicative
+   * under concurrency. Enable the logger for this class to see it.
+   */
+  private void logRemoteFetchStats() {
+    RemoteIndexFetcher fetcher = RemoteIndexFetcher.peekInstance();
+    if (fetcher == null || _remoteFetchesBefore < 0 || !LOGGER.isDebugEnabled()) {
+      return;
+    }
+    long fetches = fetcher.getFetchCount() - _remoteFetchesBefore;
+    if (fetches > 0) {
+      long bytes = fetcher.getFetchedBytes() - _remoteBytesBefore;
+      long fetchMs = (fetcher.getFetchNanos() - _remoteFetchNanosBefore) / 1_000_000;
+      long wallMs = (System.nanoTime() - _remoteStartNanos) / 1_000_000;
+      LOGGER.debug("Remote fetch stats for table: {}, {} segments: {} GETs, {} bytes, {} ms inside GETs, {} ms wall",
+          _queryContext.getTableName(), _segmentContexts.size(), fetches, bytes, fetchMs, wallMs);
+    }
+    _remoteFetchesBefore = -1;
   }
 
   @Override

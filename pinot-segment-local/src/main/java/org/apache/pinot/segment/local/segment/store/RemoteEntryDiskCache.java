@@ -58,7 +58,7 @@ public class RemoteEntryDiskCache {
   public static final String CACHE_MAX_BYTES_PROPERTY = "pinot.server.instance.remote.cache.max.bytes";
   public static final long DEFAULT_CACHE_MAX_BYTES = 10L << 30; // 10 GB
   /** Streaming chunk: bounds the transient heap used while writing an entry to disk. */
-  private static final int FETCH_CHUNK_BYTES = 8 << 20;
+  static final int FETCH_CHUNK_BYTES = 8 << 20;
 
   private static volatile RemoteEntryDiskCache _instance;
 

@@ -130,6 +130,24 @@ public interface ForwardIndexReader<T extends ForwardIndexReaderContext> extends
   }
 
   /**
+   * Hints that the given document ids are about to be read from this forward index.
+   *
+   * <p>Advisory and asynchronous: an implementation backed by remote storage may start fetching the byte ranges
+   * those documents live in, so that the reads which follow find them local. Callers issue the hint for every
+   * column of a block before reading any of them, which turns one round trip per column into one round trip per
+   * block. Readers over local memory ignore it; reads are correct whether or not anything was fetched.
+   *
+   * @param docIds Array containing the document ids about to be read
+   * @param length Number of document ids
+   * @param context Reader context
+   * @return true when the reader is backed by remote storage and took the hint, so the caller may go on to
+   *         hint the dictionary with the dictionary ids these documents decode to; false for local readers
+   */
+  default boolean prefetch(int[] docIds, int length, T context) {
+    return false;
+  }
+
+  /**
    * Reads the dictionary ids for a multi-value column at the given document id into the passed in buffer (the buffer
    * size must be enough to hold all the values for the multi-value entry) and returns the number of values within the
    * multi-value entry.

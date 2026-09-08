@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -51,8 +52,9 @@ import org.slf4j.LoggerFactory;
  * {@code columns.psf} and are served memory-mapped from the same local scratch directory.
  *
  * <p>Lifecycle per query: {@link #prefetch} starts async fetches of the query's index entries and pins them,
- * {@link #acquire} blocks until the pinned entries are resident, {@link #release} unpins them — an entry whose
- * pin count reaches zero is freed. Reads that miss (planner under-fetch) promote the whole entry synchronously
+ * {@link #acquire} marks the query active (reads wait for exactly the entry they touch, see
+ * {@link #awaitResident}), {@link #release} unpins them — an entry whose pin count reaches zero is freed.
+ * Reads that miss (planner under-fetch) promote the whole entry synchronously
  * while any query is active ("query mode"); reads with no active query (reader construction at segment load)
  * are served as small exact ranged reads through the buffer's bounded header cache, so loading a remote
  * segment never fetches index data wholesale.
@@ -75,12 +77,28 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
   private final long _maxFetchBytesPerQuery;
   /** Largest single index entry that a query-mode miss may promote wholesale. */
   private final long _maxPromoteBytes;
-  private final boolean _eagerPrefetch;
+  /** Largest index entry that plan-time prefetch pins whole; bigger entries are read in ranges on demand. */
+  private final long _pinMaxBytes;
+  /** Whether plan-time prefetch (pinning the query's index entries before execution) is enabled. */
+  private final boolean _planPrefetch;
 
   /** Entries currently resident in memory, keyed by index entry. */
   private final ConcurrentHashMap<IndexKey, ResidentEntry> _resident = new ConcurrentHashMap<>();
+  /**
+   * Offset tables of var-length dictionaries too big to pin whole, keyed by the dictionary entry. Materialized
+   * like resident entries (disk cache, mmap) so they cost no heap; the buffer is null for fixed-width
+   * dictionaries, whose value positions are arithmetic.
+   */
+  private final ConcurrentHashMap<IndexKey, ResidentEntry> _offsetTables = new ConcurrentHashMap<>();
   /** Keys pinned by each in-flight fetch context. */
   private final ConcurrentHashMap<UUID, Set<IndexKey>> _pinsByContext = new ConcurrentHashMap<>();
+  /** Offset tables pinned by each in-flight fetch context. */
+  private final ConcurrentHashMap<UUID, Set<IndexKey>> _offsetPinsByContext = new ConcurrentHashMap<>();
+  /**
+   * Parsed header of each var-length dictionary entry: {offset table start, offset table bytes}; start is -1
+   * for fixed-width dictionaries. Read once per entry and kept: it is 16 bytes of truth about the layout.
+   */
+  private final ConcurrentHashMap<IndexKey, int[]> _varLengthHeaders = new ConcurrentHashMap<>();
   /**
    * Contexts between acquire and their first release. Upstream may call release more than once for the same
    * context (and prefetch-only contexts are released without an acquire), so the active count is driven by
@@ -113,16 +131,22 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher,
       long maxFetchBytesPerQuery, long maxPromoteBytes) {
-    this(metadata, fetcher, maxFetchBytesPerQuery, maxPromoteBytes, RemoteQueryConfigs.eagerPrefetchEnabled());
+    this(metadata, fetcher, maxFetchBytesPerQuery, maxPromoteBytes, RemoteQueryConfigs.planPrefetchEnabled());
   }
 
   public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher,
-      long maxFetchBytesPerQuery, long maxPromoteBytes, boolean eagerPrefetch) {
-    _eagerPrefetch = eagerPrefetch;
+      long maxFetchBytesPerQuery, long maxPromoteBytes, boolean planPrefetch) {
+    this(metadata, fetcher, maxFetchBytesPerQuery, maxPromoteBytes, planPrefetch, RemoteQueryConfigs.pinMaxBytes());
+  }
+
+  public RemoteSegmentDirectory(RemoteSegmentMetadata metadata, RemoteIndexFetcher fetcher,
+      long maxFetchBytesPerQuery, long maxPromoteBytes, boolean planPrefetch, long pinMaxBytes) {
+    _planPrefetch = planPrefetch;
     _metadata = metadata;
     _fetcher = fetcher;
     _maxFetchBytesPerQuery = maxFetchBytesPerQuery;
     _maxPromoteBytes = maxPromoteBytes;
+    _pinMaxBytes = pinMaxBytes;
     _starTreeIndexReader = metadata.getStarTreeIndexReader();
   }
 
@@ -179,37 +203,70 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     _tier = tier;
   }
 
+  /**
+   * Plan-time prefetch: starts fetching, for this query, every index entry the planner says the query will
+   * touch — before any segment operator runs, and for every segment of the query at once. Against object
+   * storage that is the difference between one round trip and a chain of them: without it each segment's
+   * operator discovers its dictionaries, filter indexes and forward indexes one dependent read at a time.
+   *
+   * <p>Policy per planned entry, in priority order (dictionaries and filter indexes first, forward indexes
+   * last, so the per-query budget goes to what sits on the critical path):
+   * <ul>
+   *   <li>Small enough to pin ({@code <= pinMaxBytes}): materialized whole through the disk cache, in
+   *   parallel with everything else. Small structures are exactly the ones that are read many times by
+   *   dependent lookups (binary searches in dictionaries, sorted-index seeks), so they are worth having
+   *   local in full.</li>
+   *   <li>A var-length dictionary too big to pin: only its offset table is materialized. Resolving one value
+   *   is otherwise three dependent reads; with the table local it is one.</li>
+   *   <li>Anything else is left to the readers' batch hints and ranged reads.</li>
+   * </ul>
+   * Nothing here blocks: fetches are dispatched and joined by the first read that needs them, so a segment
+   * starts its filter as soon as its filter indexes land rather than after its last forward index.
+   */
   @Override
   public void prefetch(FetchContext fetchContext) {
-    if (!_eagerPrefetch) {
+    if (!_planPrefetch) {
       // Nothing is pulled up front: the operators hand each buffer the batch of docIds/dictIds they are
       // about to resolve, and that drives the fetching. An entry a query really does read end to end is
       // still fetched whole, on its first miss.
       return;
     }
     List<IndexKey> planned = plannedKeys(fetchContext);
-    long plannedBytes = 0;
-    for (IndexKey key : planned) {
-      plannedBytes += indexRange(key).getDataSize();
-    }
-    // Admission control: a query that would make more than the budget resident (e.g. SELECT * over
-    // every column) is served lazily by ranged reads instead of being materialized. Memory stays
-    // bounded; the query is slower but correct, and never takes the server down.
-    if (plannedBytes > _maxFetchBytesPerQuery) {
-      _degradedFetches.incrementAndGet();
-      LOGGER.warn("Prefetch of {} bytes across {} index entries exceeds the per-query budget of {} bytes for "
-              + "segment: {}; serving this query with ranged reads instead", plannedBytes, planned.size(),
-          _maxFetchBytesPerQuery, _metadata.getSegmentName());
+    if (planned.isEmpty()) {
       return;
     }
-    Set<IndexKey> pinned =
-        _pinsByContext.computeIfAbsent(fetchContext.getFetchId(), id -> ConcurrentHashMap.newKeySet());
+    // Critical-path structures first; forward indexes are the bulk and are read once, so they go last
+    planned.sort((a, b) -> Boolean.compare(a._type == StandardIndexes.forward(),
+        b._type == StandardIndexes.forward()));
+    UUID fetchId = fetchContext.getFetchId();
+    Set<IndexKey> pinned = _pinsByContext.computeIfAbsent(fetchId, id -> ConcurrentHashMap.newKeySet());
+    long plannedBytes = 0;
     for (IndexKey key : planned) {
-      // Entries bigger than the promote ceiling are NOT pulled whole: a query that touches a few rows of a
-      // large dictionary or forward index should read only the ranges it needs, on demand.
-      if (indexRange(key).getDataSize() > _maxPromoteBytes) {
+      long size = indexRange(key).getDataSize();
+      if (size > _pinMaxBytes) {
+        // Too big to hold whole for a query that may touch a few rows of it. A var-length dictionary still
+        // gets its offset table primed, which is what turns its lookups from three round trips into one.
+        if (key._type == StandardIndexes.dictionary()) {
+          Set<IndexKey> offsetPinned =
+              _offsetPinsByContext.computeIfAbsent(fetchId, id -> ConcurrentHashMap.newKeySet());
+          if (offsetPinned.add(key)) {
+            pinOffsetTable(key);
+          }
+        }
         continue;
       }
+      // Admission control: an entry that does not fit the per-query budget is served lazily by ranged reads
+      // (smaller ones behind it may still fit). Memory stays bounded; the query is slower but correct, and never
+      // takes the server down.
+      if (plannedBytes + size > _maxFetchBytesPerQuery) {
+        if (!pinned.contains(key)) {
+          _degradedFetches.incrementAndGet();
+          LOGGER.debug("Per-query prefetch budget of {} bytes reached for segment: {}; {} is read lazily",
+              _maxFetchBytesPerQuery, _metadata.getSegmentName(), key);
+        }
+        continue;
+      }
+      plannedBytes += size;
       if (pinned.add(key)) {
         pin(key);
       }
@@ -238,23 +295,9 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     if (_acquiredContexts.add(fetchContext.getFetchId())) {
       _activeContexts.incrementAndGet();
     }
-    // Ensure the context's entries are pinned (acquire may be called without a prior prefetch) and resident
+    // Ensure the context's entries are in flight (acquire may be called without a prior prefetch). Nothing is
+    // joined here: the first read of each entry waits for exactly that entry, see awaitResident.
     prefetch(fetchContext);
-    Set<IndexKey> pinned = _pinsByContext.get(fetchContext.getFetchId());
-    if (pinned == null) {
-      return;
-    }
-    for (IndexKey key : pinned) {
-      ResidentEntry entry = _resident.get(key);
-      if (entry != null) {
-        try {
-          entry._data.join();
-        } catch (RuntimeException e) {
-          // A failed fetch surfaces at read time as a promoted retry; acquire must not fail the whole query
-          LOGGER.warn("Prefetch of {} failed for segment: {}", key, _metadata.getSegmentName(), e);
-        }
-      }
-    }
   }
 
   @Override
@@ -262,7 +305,13 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     Set<IndexKey> pinned = _pinsByContext.remove(fetchContext.getFetchId());
     if (pinned != null) {
       for (IndexKey key : pinned) {
-        unpin(key);
+        unpin(_resident, key);
+      }
+    }
+    Set<IndexKey> offsetPinned = _offsetPinsByContext.remove(fetchContext.getFetchId());
+    if (offsetPinned != null) {
+      for (IndexKey key : offsetPinned) {
+        unpin(_offsetTables, key);
       }
     }
     // Idempotent: only the release matching a prior acquire drives the counter (upstream releases twice)
@@ -300,20 +349,46 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
     entry._pins.incrementAndGet();
   }
 
-  private void unpin(IndexKey key) {
-    ResidentEntry entry = _resident.get(key);
-    if (entry != null && entry._pins.decrementAndGet() <= 0 && _resident.remove(key, entry)) {
+  private void pinOffsetTable(IndexKey key) {
+    ResidentEntry entry = _offsetTables.compute(key, (k, current) -> {
+      if (current != null && current._data.isCompletedExceptionally()) {
+        current = null;
+      }
+      return current != null ? current
+          : new ResidentEntry(CompletableFuture.supplyAsync(() -> fetchOffsetTable(k), _fetcher.getExecutor()));
+    });
+    entry._pins.incrementAndGet();
+  }
+
+  private static void unpin(ConcurrentHashMap<IndexKey, ResidentEntry> entries, IndexKey key) {
+    ResidentEntry entry = entries.get(key);
+    if (entry != null && entry._pins.decrementAndGet() <= 0 && entries.remove(key, entry)) {
       closeQuietly(entry);
     }
   }
 
-  /** Releases an entry's mapping; the cached file stays for the next query to map again. */
+  /**
+   * Releases an entry's mapping; the cached file stays for the next query to map again. An entry whose fetch is
+   * still in flight (the query gave up before its bytes landed) is closed the moment it completes, so nothing is
+   * left mapped with no owner.
+   */
   private static void closeQuietly(ResidentEntry entry) {
-    if (!entry._data.isDone() || entry._data.isCompletedExceptionally()) {
+    if (!entry._data.isDone()) {
+      entry._data.whenComplete((buffer, error) -> closeBufferQuietly(buffer));
+      return;
+    }
+    if (entry._data.isCompletedExceptionally()) {
+      return;
+    }
+    closeBufferQuietly(entry._data.join());
+  }
+
+  private static void closeBufferQuietly(@Nullable PinotDataBuffer buffer) {
+    if (buffer == null) {
       return;
     }
     try {
-      entry._data.join().close();
+      buffer.close();
     } catch (Exception e) {
       LOGGER.warn("Failed to release mapped remote entry", e);
     }
@@ -321,7 +396,12 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
 
   /** Frees entries fetched by sync misses (pin count 0) once no query is active. */
   private void freeStrays() {
-    _resident.entrySet().removeIf(entry -> {
+    freeStrays(_resident);
+    freeStrays(_offsetTables);
+  }
+
+  private static void freeStrays(ConcurrentHashMap<IndexKey, ResidentEntry> entries) {
+    entries.entrySet().removeIf(entry -> {
       if (entry.getValue()._pins.get() > 0) {
         return false;
       }
@@ -331,8 +411,8 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
   }
 
   /**
-   * Returns the resident buffer of the entry when already fetched, without fetching. Used as the buffers'
-   * fast path.
+   * Returns the resident buffer of the entry when already fetched, without fetching or waiting. Used by tests
+   * and diagnostics; the buffers' read path uses {@link #awaitResident}.
    */
   @Nullable
   PinotDataBuffer peekResident(IndexKey key) {
@@ -341,6 +421,122 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
       return entry._data.join();
     }
     return null;
+  }
+
+  /**
+   * Returns the resident buffer of the entry, waiting for it when a fetch is in flight (plan-time prefetch
+   * or another query's promotion); null when nothing is resident or the fetch failed, in which case the
+   * caller falls back to ranged reads. Waiting beats reading around the fetch: the bytes are already on the
+   * way, and a duplicate ranged read would only add requests.
+   */
+  @Nullable
+  PinotDataBuffer awaitResident(IndexKey key) {
+    ResidentEntry entry = _resident.get(key);
+    if (entry == null) {
+      return null;
+    }
+    try {
+      return entry._data.join();
+    } catch (RuntimeException e) {
+      LOGGER.warn("Prefetch of {} failed for segment: {}; serving ranged reads instead", key,
+          _metadata.getSegmentName(), e);
+      return null;
+    }
+  }
+
+  /**
+   * Returns the materialized offset table of a var-length dictionary entry (mapped, big-endian, positioned at
+   * {@link #offsetTableStart} within the entry's data), waiting for an in-flight fetch or fetching it now when
+   * plan-time prefetch has not; null for fixed-width dictionaries and when the table could not be fetched. The
+   * table is retained until every pinning query released it, or by the stray sweep when it was never pinned.
+   */
+  @Nullable
+  PinotDataBuffer offsetTable(IndexKey key) {
+    ResidentEntry entry = _offsetTables.get(key);
+    if (entry == null || entry._data.isCompletedExceptionally()) {
+      entry = _offsetTables.compute(key, (k, current) -> {
+        if (current != null && !current._data.isCompletedExceptionally()) {
+          return current;
+        }
+        return new ResidentEntry(
+            CompletableFuture.supplyAsync(() -> fetchOffsetTable(k), _fetcher.getExecutor()));
+      });
+    }
+    try {
+      return entry._data.join();
+    } catch (RuntimeException e) {
+      LOGGER.warn("Offset table of {} could not be primed for segment: {}", key, _metadata.getSegmentName(), e);
+      return null;
+    }
+  }
+
+  /** Where the offset table starts within a var-length dictionary entry's data; valid after {@link #offsetTable}. */
+  int offsetTableStart(IndexKey key) {
+    return _varLengthHeaders.get(key)[0];
+  }
+
+  /**
+   * Reads the 16-byte header of a var-length dictionary (magic, version, count, data start), remembers where its
+   * offset table is and materializes the table. Returns null for fixed-width dictionaries.
+   */
+  @Nullable
+  private PinotDataBuffer fetchOffsetTable(IndexKey key) {
+    int[] header = _varLengthHeaders.get(key);
+    if (header == null) {
+      // The GET happens outside the map's compute so it never blocks other keys hashing to the same bin
+      byte[] bytes = new byte[RemoteSegmentBuffer.VAR_LENGTH_HEADER_BYTES];
+      readDataRange(key, 0, bytes, bytes.length);
+      header = RemoteSegmentBuffer.parseVarLengthHeader(bytes, indexRange(key).getDataSize());
+      _varLengthHeaders.putIfAbsent(key, header);
+    }
+    if (header[0] < 0) {
+      return null;
+    }
+    int start = header[0];
+    long tableBytes = header[1];
+    RemoteEntryDiskCache.RangeReader reader =
+        (offsetInTable, target, length) -> readDataRange(key, start + offsetInTable, target, length);
+    return materialize(key._name + "." + key._type.getId() + ".offsets", tableBytes, reader);
+  }
+
+  /**
+   * Starts materializing the whole entry without pinning it (freed by the stray sweep once no query is active),
+   * for a hinted batch too scattered to fetch range by range. Reads that follow wait for it via
+   * {@link #awaitResident}. No-op when the entry is already resident or in flight.
+   */
+  void promoteAsync(IndexKey key) {
+    if (RemoteQueryConfigs.storageMode() == RemoteQueryConfigs.StorageMode.HEAP) {
+      // A hinted promotion may run to hundreds of MBs; only disk-backed modes keep that off the JVM heap
+      return;
+    }
+    _resident.compute(key, (k, current) -> {
+      if (current != null && !current._data.isCompletedExceptionally()) {
+        return current;
+      }
+      _syncMisses.incrementAndGet();
+      return new ResidentEntry(CompletableFuture.supplyAsync(() -> fetchWholeEntry(k), _fetcher.getExecutor()));
+    });
+  }
+
+  /** True when the entry is resident or being made resident (pinned or promoted); never waits. */
+  boolean hasResident(IndexKey key) {
+    ResidentEntry entry = _resident.get(key);
+    return entry != null && !entry._data.isCompletedExceptionally();
+  }
+
+  /** The materialized offset table of a var-length dictionary when already fetched, else null; never waits. */
+  @Nullable
+  PinotDataBuffer peekOffsetTable(IndexKey key) {
+    ResidentEntry entry = _offsetTables.get(key);
+    if (entry != null && entry._data.isDone() && !entry._data.isCompletedExceptionally()) {
+      return entry._data.join();
+    }
+    return null;
+  }
+
+  /** Runs a batch of ranged reads off the caller's thread; see {@link RemoteSegmentBuffer#prefetchRanges}. */
+  CompletableFuture<Void> readDataRangesAsync(IndexKey key, List<long[]> ranges, List<byte[]> targets) {
+    return CompletableFuture.runAsync(() -> readDataRanges(key, ranges, targets), _fetcher.getExecutor());
   }
 
   /**
@@ -404,27 +600,84 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
    * entry is served locally.
    */
   private PinotDataBuffer fetchWholeEntry(IndexKey key) {
-    RemoteSegmentMetadata.IndexRange range = indexRange(key);
-    String segmentKey = _metadata.getSegmentName() + ":" + _metadata.getCrc();
-    String entryName = key._name + "." + key._type.getId();
     RemoteEntryDiskCache.RangeReader reader =
         (offsetInData, target, length) -> readDataRange(key, offsetInData, target, length);
+    long size = indexRange(key).getDataSize();
+    // Disk-backed modes stream the entry chunk by chunk, which the read-ahead overlaps; heap mode reads it in one
+    // call and must see the plain reader
+    if (size > RemoteEntryDiskCache.FETCH_CHUNK_BYTES
+        && RemoteQueryConfigs.storageMode() != RemoteQueryConfigs.StorageMode.HEAP) {
+      reader = new ReadAheadRangeReader(reader, size);
+    }
+    return materialize(key._name + "." + key._type.getId(), size, reader);
+  }
+
+  /**
+   * Keeps the next chunks of a whole-entry stream in flight while the current one is written to disk, so a
+   * multi-chunk entry costs about one round trip instead of one per chunk. The disk cache streams an entry
+   * front to back in fixed chunks, which is the only access pattern this handles; anything else falls through
+   * to the wrapped reader. Heap held at any time is bounded by the window.
+   */
+  private final class ReadAheadRangeReader implements RemoteEntryDiskCache.RangeReader {
+    private static final int WINDOW = 4;
+    private final RemoteEntryDiskCache.RangeReader _reader;
+    private final long _size;
+    private final Map<Long, CompletableFuture<byte[]>> _inFlight = new HashMap<>();
+
+    ReadAheadRangeReader(RemoteEntryDiskCache.RangeReader reader, long size) {
+      _reader = reader;
+      _size = size;
+    }
+
+    @Override
+    public void read(long offset, byte[] target, int length) {
+      // Called from a single materializing thread, in order; no synchronization needed
+      for (int i = 0; i < WINDOW; i++) {
+        long next = offset + (long) i * RemoteEntryDiskCache.FETCH_CHUNK_BYTES;
+        if (next >= _size || _inFlight.containsKey(next)) {
+          continue;
+        }
+        int nextLength = (int) Math.min(RemoteEntryDiskCache.FETCH_CHUNK_BYTES, _size - next);
+        _inFlight.put(next, CompletableFuture.supplyAsync(() -> {
+          byte[] chunk = new byte[nextLength];
+          _reader.read(next, chunk, nextLength);
+          return chunk;
+        }, _fetcher.getExecutor()));
+      }
+      CompletableFuture<byte[]> current = _inFlight.remove(offset);
+      if (current == null) {
+        _reader.read(offset, target, length);
+        return;
+      }
+      byte[] chunk = current.join();
+      if (chunk.length < length) {
+        throw new IllegalStateException("Read-ahead chunk shorter than requested: " + chunk.length + " < " + length);
+      }
+      System.arraycopy(chunk, 0, target, 0, length);
+    }
+  }
+
+  /**
+   * Materializes {@code size} bytes served by {@code reader} under the configured storage mode: on the heap,
+   * in the reusable disk cache, or spilled to an unlinked file — the latter two memory-mapped so the JVM heap
+   * never holds the bytes.
+   */
+  private PinotDataBuffer materialize(String entryName, long size, RemoteEntryDiskCache.RangeReader reader) {
+    String segmentKey = _metadata.getSegmentName() + ":" + _metadata.getCrc();
     switch (RemoteQueryConfigs.storageMode()) {
       case HEAP:
         // Nothing touches disk: the entry lives on the JVM heap until the query releases it.
-        int dataSize = Math.toIntExact(range.getDataSize());
+        int dataSize = Math.toIntExact(size);
         byte[] data = new byte[dataSize];
-        readDataRange(key, 0, data, dataSize);
+        reader.read(0, data, dataSize);
         return PinotByteBuffer.wrap(ByteBuffer.wrap(data));
       case CACHE:
-        return RemoteEntryDiskCache.getInstance()
-            .getOrFetch(segmentKey, entryName, range.getDataSize(), reader);
+        return RemoteEntryDiskCache.getInstance().getOrFetch(segmentKey, entryName, size, reader);
       case SPILL:
       default:
         // Disk-backed but query-scoped: mapped from a file that is unlinked immediately, so heap stays flat
         // and the space is returned as soon as the query releases the mapping.
-        return RemoteEntryDiskCache.getInstance()
-            .fetchEphemeral(segmentKey, entryName, range.getDataSize(), reader);
+        return RemoteEntryDiskCache.getInstance().fetchEphemeral(segmentKey, entryName, size, reader);
     }
   }
 
@@ -508,7 +761,10 @@ public class RemoteSegmentDirectory extends SegmentDirectory {
       throws IOException {
     _resident.values().forEach(RemoteSegmentDirectory::closeQuietly);
     _resident.clear();
+    _offsetTables.values().forEach(RemoteSegmentDirectory::closeQuietly);
+    _offsetTables.clear();
     _pinsByContext.clear();
+    _offsetPinsByContext.clear();
     // The star-tree reader is owned by the registry entry (shared across reloads of this segment) and is
     // closed on entry removal, not here.
   }

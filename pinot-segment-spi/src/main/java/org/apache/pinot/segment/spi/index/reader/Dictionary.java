@@ -138,6 +138,19 @@ public interface Dictionary extends IndexReader {
    */
   Comparable getMaxVal();
 
+  /**
+   * Hints that the given dictionary ids are about to be resolved to values.
+   *
+   * <p>Advisory and asynchronous, like {@link ForwardIndexReader#prefetch}: a dictionary backed by remote storage
+   * may start fetching the values' byte ranges so the lookups that follow find them local. Local dictionaries
+   * ignore it.
+   *
+   * @param dictIds Dictionary ids about to be resolved
+   * @param length Number of dictionary ids
+   */
+  default void prefetch(int[] dictIds, int length) {
+  }
+
   /// Returns a sorted array of all values in the dictionary. For type INT/LONG/FLOAT/DOUBLE, primitive type array
   /// will be returned; for type BIG_DECIMAL, `BigDecimal[]` will be returned; for type STRING, `String[]` will be
   /// returned; for type BYTES, `ByteArray[]` will be returned.

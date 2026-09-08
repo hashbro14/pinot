@@ -1,0 +1,33 @@
+{
+  "schemaName": "artist_dashboard_daily_streams_aggregated",
+  "dimensionFieldSpecs": [
+    { "name": "artist_id", "dataType": "LONG" },
+    { "name": "owner_id", "dataType": "INT" },
+    { "name": "label_id", "dataType": "INT" },
+    { "name": "album_id", "dataType": "LONG" },
+    { "name": "song_id", "dataType": "INT" },
+    { "name": "song_name", "dataType": "STRING" },
+    { "name": "song_name_arabic", "dataType": "STRING" },
+    { "name": "artist_name", "dataType": "STRING" },
+    { "name": "artist_name_arabic", "dataType": "STRING" },
+    { "name": "country_code", "dataType": "STRING" },
+    { "name": "country_name", "dataType": "STRING" }
+  ],
+  "metricFieldSpecs": [
+    { "name": "total_accountable_streams", "dataType": "LONG" },
+    { "name": "all_streams", "dataType": "LONG" },
+    { "name": "full_streams", "dataType": "LONG" },
+    { "name": "total_accountable_video_streams", "dataType": "LONG" },
+    { "name": "all_video_streams", "dataType": "LONG" },
+    { "name": "full_video_streams", "dataType": "LONG" },
+    { "name": "total_seconds_streamed", "dataType": "DOUBLE" }
+  ],
+  "dateTimeFieldSpecs": [
+    {
+      "name": "day_dt",
+      "dataType": "STRING",
+      "format": "1:DAYS:SIMPLE_DATE_FORMAT:yyyy-MM-dd",
+      "granularity": "1:DAYS"
+    }
+  ]
+}

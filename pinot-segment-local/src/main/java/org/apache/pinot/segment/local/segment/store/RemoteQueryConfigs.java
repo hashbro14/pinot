@@ -105,7 +105,7 @@ public class RemoteQueryConfigs {
   }
 
   public static StorageMode storageMode() {
-    String mode = System.getProperty("pinot.server.instance." + INSTANCE_STORAGE_MODE);
+    String mode = System.getProperty(INSTANCE_PROPERTY_PREFIX + INSTANCE_STORAGE_MODE);
     if (mode != null) {
       try {
         return StorageMode.valueOf(mode.trim().toUpperCase(java.util.Locale.ROOT));
@@ -114,7 +114,7 @@ public class RemoteQueryConfigs {
       }
     }
     // Backwards compatibility with the older boolean flag
-    String cacheEnabled = System.getProperty("pinot.server.instance." + INSTANCE_CACHE_ENABLED);
+    String cacheEnabled = System.getProperty(INSTANCE_PROPERTY_PREFIX + INSTANCE_CACHE_ENABLED);
     if (cacheEnabled != null) {
       return Boolean.parseBoolean(cacheEnabled.trim()) ? StorageMode.CACHE : StorageMode.HEAP;
     }
@@ -123,25 +123,96 @@ public class RemoteQueryConfigs {
 
   /** False disables the disk cache so every query fetches from the deep store (benchmark mode). */
   public static boolean diskCacheEnabled() {
-    String override = System.getProperty("pinot.server.instance." + INSTANCE_CACHE_ENABLED);
+    String override = System.getProperty(INSTANCE_PROPERTY_PREFIX + INSTANCE_CACHE_ENABLED);
     return override == null || Boolean.parseBoolean(override.trim());
   }
 
-  /** Largest index entry fetched whole; overridable with the matching system property. */
-  public static final String INSTANCE_EAGER_PREFETCH_ENABLED = "remote.eager.prefetch.enabled";
+  public static final String INSTANCE_PLAN_PREFETCH_ENABLED = "remote.plan.prefetch.enabled";
 
   /**
-   * Whether acquiring a segment should pull every planned index entry whole, up to the promote ceiling.
+   * Whether the index entries a query plans to touch are fetched before execution starts, for every segment
+   * at once, instead of being discovered one dependent read at a time by each segment's operators.
    *
-   * <p>Off by default. Readers now hand the buffer the batch of docIds or dictIds they are about to
-   * resolve, so a selective query fetches just those ranges; pulling whole entries up front would read
-   * hundreds of megabytes to answer a ten-row lookup. Queries that really do touch a whole entry still
-   * get it in one read, via the promote-on-miss path. Turn this on to restore the eager behaviour.
+   * <p>On by default. What gets pulled whole is bounded by {@link #pinMaxBytes()} per entry and
+   * {@link #maxFetchBytesPerQuery()} per query; a var-length dictionary above the pin ceiling gets only its
+   * offset table. Turn this off to measure the lazy path.
    */
-  public static boolean eagerPrefetchEnabled() {
-    return Boolean.parseBoolean(
-        System.getProperty("pinot.server.instance." + INSTANCE_EAGER_PREFETCH_ENABLED, "false"));
+  public static boolean planPrefetchEnabled() {
+    String value = System.getProperty(INSTANCE_PROPERTY_PREFIX + INSTANCE_PLAN_PREFETCH_ENABLED);
+    if (value == null) {
+      // The pre-rename key of the same switch; honoured so an explicit setting keeps working
+      value = System.getProperty(INSTANCE_PROPERTY_PREFIX + LEGACY_EAGER_PREFETCH_ENABLED, "true");
+    }
+    return Boolean.parseBoolean(value);
   }
+
+  /** Former name of {@link #INSTANCE_PLAN_PREFETCH_ENABLED}; read as a fallback only. */
+  static final String LEGACY_EAGER_PREFETCH_ENABLED = "remote.eager.prefetch.enabled";
+
+  public static final String INSTANCE_PIN_MAX_BYTES = "remote.pin.max.bytes";
+  /**
+   * Default pin ceiling. Sized so per-segment forward indexes and small dictionaries (single-digit MBs on a
+   * day-sized segment) are pinned in one GET each, while the large string dictionaries a projection barely
+   * touches (tens to hundreds of MBs) are left to their offset tables and ranged reads: pinning those whole
+   * for a ten-row lookup measured as the dominant cost of {@code SELECT * LIMIT 10}.
+   */
+  public static final long DEFAULT_PIN_MAX_BYTES = 8L << 20;
+
+  /** Largest index entry plan-time prefetch pins whole; never above the promote ceiling. */
+  public static long pinMaxBytes() {
+    return Math.min(longProperty(INSTANCE_PIN_MAX_BYTES, DEFAULT_PIN_MAX_BYTES), promoteMaxBytes());
+  }
+
+  public static final String INSTANCE_HINT_PROMOTE_MAX_BYTES = "remote.hint.promote.max.bytes";
+  public static final long DEFAULT_HINT_PROMOTE_MAX_BYTES = 512L << 20;
+
+  /**
+   * Largest index entry a batch hint may materialize whole when its ranges are too scattered to coalesce
+   * within budget. Above the promote ceiling on purpose: a hinted batch is a query that will keep coming back
+   * for thousands of scattered values (a GROUP BY on a high-cardinality string column), and one streamed
+   * transfer beats thousands of round trips even at hundreds of megabytes. Spill/cache modes keep it off heap.
+   */
+  public static long hintedPromoteMaxBytes() {
+    return longProperty(INSTANCE_HINT_PROMOTE_MAX_BYTES, DEFAULT_HINT_PROMOTE_MAX_BYTES);
+  }
+
+  public static final String INSTANCE_PIPELINED_HINTS_ENABLED = "remote.pipelined.hints.enabled";
+
+  /**
+   * Whether a projection hints every column of a block — forward indexes first, then the dictionaries with
+   * the ids those decode to — before reading any of them, so one block costs one or two round trips instead
+   * of one or two per column. On by default; off restores per-column synchronous hinting, for measuring.
+   */
+  public static boolean pipelinedHintsEnabled() {
+    return Boolean.parseBoolean(
+        System.getProperty(INSTANCE_PROPERTY_PREFIX + INSTANCE_PIPELINED_HINTS_ENABLED, "true"));
+  }
+
+  public static final String INSTANCE_FETCH_DEBUG_LATENCY_MS = "remote.fetch.debug.latency.ms";
+
+  /**
+   * Artificial first-byte latency added to every ranged GET, for measuring round-trip counts against a local
+   * deep store. Zero (the default) in production. Injected per request, not per link, so concurrent requests
+   * overlap the way they do against real object storage — the property a network-level delay cannot model.
+   */
+  public static long fetchDebugLatencyMs() {
+    return longProperty(INSTANCE_FETCH_DEBUG_LATENCY_MS, 0);
+  }
+
+  public static int fetchParallelism() {
+    return (int) longProperty(INSTANCE_FETCH_PARALLELISM, DEFAULT_FETCH_PARALLELISM);
+  }
+
+  public static int fetchTimeoutSeconds() {
+    return (int) longProperty(INSTANCE_FETCH_TIMEOUT_SECONDS, DEFAULT_FETCH_TIMEOUT_SECONDS);
+  }
+
+  public static long coalesceGapBytes() {
+    return longProperty(INSTANCE_COALESCE_GAP_BYTES, DEFAULT_COALESCE_GAP_BYTES);
+  }
+
+  /** Prefix under which every instance-level key above is looked up as a system property. */
+  public static final String INSTANCE_PROPERTY_PREFIX = "pinot.server.instance.";
 
   public static final String INSTANCE_PREFETCH_COALESCE_GAP_BYTES = "remote.prefetch.coalesce.gap.bytes";
   public static final long DEFAULT_PREFETCH_COALESCE_GAP_BYTES = 4L << 10; // 4 KB
@@ -186,7 +257,7 @@ public class RemoteQueryConfigs {
   }
 
   private static long longProperty(String key, long defaultValue) {
-    String override = System.getProperty("pinot.server.instance." + key);
+    String override = System.getProperty(INSTANCE_PROPERTY_PREFIX + key);
     if (override != null) {
       try {
         return Long.parseLong(override.trim());

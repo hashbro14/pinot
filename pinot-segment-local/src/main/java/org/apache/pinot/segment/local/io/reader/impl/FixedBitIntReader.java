@@ -33,6 +33,11 @@ public abstract class FixedBitIntReader {
     _dataBuffer = dataBuffer;
   }
 
+  /** True when the underlying buffer lives in remote storage; see {@link PinotDataBuffer#remoteBacked()}. */
+  public boolean remoteBacked() {
+    return _dataBuffer.remoteBacked();
+  }
+
   /**
    * Hints that the values at the first {@code length} entries of {@code indexes} are about to be read.
    *

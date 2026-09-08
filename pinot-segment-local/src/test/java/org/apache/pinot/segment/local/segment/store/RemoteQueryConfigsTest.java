@@ -38,7 +38,21 @@ public class RemoteQueryConfigsTest {
   public void clearOverrides() {
     System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PREFETCH_COALESCE_GAP_BYTES);
     System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PREFETCH_MAX_BYTES);
-    System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_EAGER_PREFETCH_ENABLED);
+    System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PLAN_PREFETCH_ENABLED);
+    System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PIN_MAX_BYTES);
+    System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_FETCH_DEBUG_LATENCY_MS);
+    System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_HINT_PROMOTE_MAX_BYTES);
+    System.clearProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PIPELINED_HINTS_ENABLED);
+  }
+
+  @Test
+  public void testHintedPromoteCeilingAndPipelinedHintsOverrides() {
+    assertEquals(RemoteQueryConfigs.hintedPromoteMaxBytes(), RemoteQueryConfigs.DEFAULT_HINT_PROMOTE_MAX_BYTES);
+    System.setProperty(PREFIX + RemoteQueryConfigs.INSTANCE_HINT_PROMOTE_MAX_BYTES, "1024");
+    assertEquals(RemoteQueryConfigs.hintedPromoteMaxBytes(), 1024L);
+    assertTrue(RemoteQueryConfigs.pipelinedHintsEnabled());
+    System.setProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PIPELINED_HINTS_ENABLED, "false");
+    assertFalse(RemoteQueryConfigs.pipelinedHintsEnabled());
   }
 
   @Test
@@ -57,17 +71,37 @@ public class RemoteQueryConfigsTest {
   }
 
   @Test
-  public void testEagerPrefetchDefaultsOffAndCanBeRestored() {
-    assertFalse(RemoteQueryConfigs.eagerPrefetchEnabled());
-    System.setProperty(PREFIX + RemoteQueryConfigs.INSTANCE_EAGER_PREFETCH_ENABLED, "true");
-    assertTrue(RemoteQueryConfigs.eagerPrefetchEnabled());
+  public void testPlanPrefetchDefaultsOnAndCanBeDisabled() {
+    assertTrue(RemoteQueryConfigs.planPrefetchEnabled());
+    System.setProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PLAN_PREFETCH_ENABLED, "false");
+    assertFalse(RemoteQueryConfigs.planPrefetchEnabled());
+  }
+
+  @Test
+  public void testPinCeilingDefaultsBelowPromoteCeilingAndIsCappedByIt() {
+    assertEquals(RemoteQueryConfigs.pinMaxBytes(), RemoteQueryConfigs.DEFAULT_PIN_MAX_BYTES);
+    assertTrue(RemoteQueryConfigs.pinMaxBytes() <= RemoteQueryConfigs.promoteMaxBytes());
+    System.setProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PIN_MAX_BYTES, "4194304");
+    assertEquals(RemoteQueryConfigs.pinMaxBytes(), 4194304L);
+    // Never above what a miss may promote: pinning more than that would bypass the promote ceiling
+    System.setProperty(PREFIX + RemoteQueryConfigs.INSTANCE_PIN_MAX_BYTES, String.valueOf(Long.MAX_VALUE));
+    assertEquals(RemoteQueryConfigs.pinMaxBytes(), RemoteQueryConfigs.promoteMaxBytes());
+  }
+
+  @Test
+  public void testDebugLatencyDefaultsToZero() {
+    assertEquals(RemoteQueryConfigs.fetchDebugLatencyMs(), 0L);
+    System.setProperty(PREFIX + RemoteQueryConfigs.INSTANCE_FETCH_DEBUG_LATENCY_MS, "25");
+    assertEquals(RemoteQueryConfigs.fetchDebugLatencyMs(), 25L);
   }
 
   @Test
   public void testInstanceKeysDoNotCarryThePrefixThemselves() {
     for (String key : new String[]{
         RemoteQueryConfigs.INSTANCE_PREFETCH_COALESCE_GAP_BYTES, RemoteQueryConfigs.INSTANCE_PREFETCH_MAX_BYTES,
-        RemoteQueryConfigs.INSTANCE_EAGER_PREFETCH_ENABLED, RemoteQueryConfigs.INSTANCE_PROMOTE_MAX_BYTES,
+        RemoteQueryConfigs.INSTANCE_PLAN_PREFETCH_ENABLED, RemoteQueryConfigs.INSTANCE_PROMOTE_MAX_BYTES,
+        RemoteQueryConfigs.INSTANCE_PIN_MAX_BYTES, RemoteQueryConfigs.INSTANCE_FETCH_DEBUG_LATENCY_MS,
+        RemoteQueryConfigs.INSTANCE_HINT_PROMOTE_MAX_BYTES, RemoteQueryConfigs.INSTANCE_PIPELINED_HINTS_ENABLED,
         RemoteQueryConfigs.INSTANCE_MAX_FETCH_BYTES_PER_QUERY, RemoteQueryConfigs.INSTANCE_COALESCE_GAP_BYTES,
         RemoteQueryConfigs.INSTANCE_FETCH_PARALLELISM, RemoteQueryConfigs.INSTANCE_FETCH_TIMEOUT_SECONDS,
         RemoteQueryConfigs.INSTANCE_STORAGE_MODE, RemoteQueryConfigs.INSTANCE_CACHE_ENABLED}) {

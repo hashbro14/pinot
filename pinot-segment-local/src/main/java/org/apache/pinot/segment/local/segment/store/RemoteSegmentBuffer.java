@@ -27,34 +27,29 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.annotation.Nullable;
 import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+
 /**
- * Lazy {@link PinotDataBuffer} over (a range of) one index entry of a remote segment's {@code columns.psf}.
+ * A {@link PinotDataBuffer} over one index entry of a segment that lives in the deep store.
  *
- * <p>Reads follow a three-tier strategy:
- * <ol>
- *   <li><b>Resident fast path</b> — when the whole entry is resident in the directory (query prefetch or an
- *       earlier promotion), reads delegate to the in-memory buffer. Residency is re-checked by identity on
- *       every read, so an entry freed by the directory is not retained here and its memory can be reclaimed;
- *       a later read simply falls to the tiers below (or re-promotes).</li>
- *   <li><b>Load-mode small reads</b> — with no query active (index reader construction at segment load),
- *       reads are served as exact small ranged fetches, kept in a bounded per-buffer cache so repeated
- *       header reads do not refetch. This keeps segment load from downloading index data wholesale.</li>
- *   <li><b>Query-mode miss</b> — a read while queries are active but the entry is not resident (planner
- *       under-fetch) promotes the whole entry synchronously, then serves from it.</li>
- * </ol>
+ * <p>Reads are served in tiers: from the entry when the directory holds it resident (pinned by plan-time
+ * prefetch or promoted whole), from ranges already fetched into this buffer, from ranges a batch hint put in
+ * flight, and only then by a fresh ranged read with read-ahead sized to the access pattern.
  *
- * <p>{@link #view} returns another lazy buffer over the sub-range (no fetch); only
- * {@link #toDirectByteBuffer} forces the entry resident, because it must hand out contiguous memory.
- * The buffer is read-only — all mutating methods throw.
+ * <p>Batch hints ({@link #prefetchRanges}) are asynchronous: the caller is not made to wait for bytes it has
+ * not asked to read yet, so an operator can hint every column of a block and then read them, paying one round
+ * trip for the block instead of one per column. A read that lands in a range still in flight waits for that
+ * range rather than fetching around it.
  *
- * <p>Thread-safety: reads may come from multiple query threads. The sub-range cache is guarded by its own
- * monitor and never holds the monitor across network fetches; the resident view cache uses benign races
- * (worst case a rebuilt view).
+ * <p>Thread-safety: the sub-range and pending-range state is guarded by the sub-range map's monitor; resident
+ * views are re-resolved per call so the directory may free entries at any time.
  */
 public class RemoteSegmentBuffer extends PinotDataBuffer {
   private static final Logger LOGGER = LoggerFactory.getLogger(RemoteSegmentBuffer.class);
@@ -87,9 +82,9 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   private static final byte[] VAR_LENGTH_MAGIC = {'.', 'v', 'l', ';'};
   private static final int VAR_LENGTH_NUM_VALUES_OFFSET = 8;
   private static final int VAR_LENGTH_DATA_SECTION_OFFSET_POSITION = 12;
-  private static final int VAR_LENGTH_HEADER_BYTES = 16;
+  static final int VAR_LENGTH_HEADER_BYTES = 16;
   /** Refuse to prime absurdly large offset tables; those fall back to ordinary ranged reads. */
-  private static final long MAX_OFFSET_TABLE_BYTES = 4L << 20;
+  private static final long MAX_OFFSET_TABLE_BYTES = 16L << 20;
   /** Two prefetched ranges closer than this are merged: one bigger GET beats two with a hole between them. */
   private static final long PREFETCH_COALESCE_GAP_BYTES = RemoteQueryConfigs.prefetchCoalesceGapBytes();
   /** Give up on prefetching rather than blow the sub-range cache. */
@@ -98,6 +93,8 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   private static final int WHOLE_ENTRY_PREFETCH_RATIO = 4;
   /** Hard ceiling on requests issued for one batch; past it, reading the entry whole is cheaper. */
   private static final int MAX_PREFETCH_RANGES = RemoteQueryConfigs.prefetchMaxRanges();
+  /** Largest entry a declined (too scattered) hint may materialize whole instead. */
+  private static final long HINTED_PROMOTE_MAX_BYTES = RemoteQueryConfigs.hintedPromoteMaxBytes();
 
   private final RemoteSegmentDirectory _directory;
   private final IndexKey _key;
@@ -113,18 +110,33 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   /** Load-mode cache: start offset (within this buffer) -> fetched bytes. Guarded by itself. */
   private final NavigableMap<Long, byte[]> _subRanges = new TreeMap<>();
   private long _cachedSubRangeBytes;
+  /** Ranges a batch hint has put in flight and that are not yet in {@link #_subRanges}. Guarded by _subRanges. */
+  private final List<PendingRange> _pending = new ArrayList<>();
   /** End of the previous ranged read, used to tell a scan apart from random lookups. */
   private volatile long _lastReadEnd = -1;
   /** True when this entry is a dictionary, whose offset table is worth fetching up front. */
   private final boolean _dictionary;
-  private volatile boolean _offsetTablePrimed;
-  private volatile byte[] _offsetTable;
-  private volatile int _offsetTableStart;
   /** Ranged reads this buffer has actually issued; used by tests and for diagnosing fetch patterns. */
   private final AtomicLong _rangeFetches = new AtomicLong();
   /** Random (non-sequential) reads served so far; drives escalation to a single bulk fetch. */
-  private final java.util.concurrent.atomic.AtomicInteger _randomReads =
-      new java.util.concurrent.atomic.AtomicInteger();
+  private final AtomicInteger _randomReads = new AtomicInteger();
+
+  /** A hinted range whose bytes are on the way; {@code _done} completes once they are in the sub-range cache. */
+  private static final class PendingRange {
+    final long _start;
+    final long _end;
+    final CompletableFuture<Void> _done;
+
+    PendingRange(long start, long end, CompletableFuture<Void> done) {
+      _start = start;
+      _end = end;
+      _done = done;
+    }
+
+    boolean covers(long offset, int length) {
+      return _start <= offset && offset + length <= _end;
+    }
+  }
 
   RemoteSegmentBuffer(RemoteSegmentDirectory directory, IndexKey key, long baseOffset, long size, ByteOrder order) {
     this(directory, key, baseOffset, size, order, false);
@@ -142,64 +154,64 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   }
 
   /**
-   * Reads the offset table of a variable-length dictionary in one shot and keeps it for this buffer's life.
+   * Parses the header of a dictionary entry. Returns {offset table start, offset table bytes} for a var-length
+   * dictionary whose table is worth priming, {-1, -1} for a fixed-width dictionary or an unreasonable table.
+   */
+  static int[] parseVarLengthHeader(byte[] header, long entrySize) {
+    for (int i = 0; i < VAR_LENGTH_MAGIC.length; i++) {
+      if (header[i] != VAR_LENGTH_MAGIC[i]) {
+        return new int[]{-1, -1}; // fixed-width dictionary: nothing to prime
+      }
+    }
+    ByteBuffer head = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN);
+    int numValues = head.getInt(VAR_LENGTH_NUM_VALUES_OFFSET);
+    int offsetTableStart = head.getInt(VAR_LENGTH_DATA_SECTION_OFFSET_POSITION);
+    long offsetTableBytes = (numValues + 1L) * Integer.BYTES;
+    if (numValues <= 0 || offsetTableStart < 0 || offsetTableStart + offsetTableBytes > entrySize
+        || offsetTableBytes > MAX_OFFSET_TABLE_BYTES) {
+      return new int[]{-1, -1};
+    }
+    return new int[]{offsetTableStart, Math.toIntExact(offsetTableBytes)};
+  }
+
+  /**
+   * Serves a read of a variable-length dictionary out of its offset table when the table is local and covers
+   * the range; null otherwise.
    *
    * <p>Resolving one value of such a dictionary is three dependent reads: two into the offset table to learn
    * where the value lives, then the value itself. Locally those are page-cache hits; against object storage
    * each is a round trip, so a thousand-row projection becomes thousands of requests. The offset table is
-   * contiguous ((numValues + 1) * 4 bytes), so fetching it once turns every later lookup into a single read
-   * for the value bytes alone.
-   *
-   * <p>No-op for fixed-width dictionaries, whose value positions are computed arithmetically.
+   * contiguous ((numValues + 1) * 4 bytes), so having it once turns every later lookup into a single read
+   * for the value bytes alone. The table is owned by the directory (materialized through the disk cache,
+   * usually already in flight from plan-time prefetch) and re-resolved per call so directory frees are
+   * honored. Fixed-width dictionaries have no table: their value positions are arithmetic.
    */
-  private void primeDictionaryOffsets() {
-    if (_offsetTable != null || _offsetTablePrimed) {
-      return;
-    }
-    _offsetTablePrimed = true;
-    try {
-      byte[] header = new byte[VAR_LENGTH_HEADER_BYTES];
-      _rangeFetches.incrementAndGet();
-      _directory.readDataRange(_key, _baseOffset, header, header.length);
-      ByteBuffer head = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN);
-      for (int i = 0; i < VAR_LENGTH_MAGIC.length; i++) {
-        if (header[i] != VAR_LENGTH_MAGIC[i]) {
-          return; // fixed-width dictionary: nothing to prime
-        }
-      }
-      int numValues = head.getInt(VAR_LENGTH_NUM_VALUES_OFFSET);
-      int offsetTableStart = head.getInt(VAR_LENGTH_DATA_SECTION_OFFSET_POSITION);
-      long offsetTableBytes = (numValues + 1L) * Integer.BYTES;
-      if (numValues <= 0 || offsetTableStart < 0 || offsetTableStart + offsetTableBytes > _size
-          || offsetTableBytes > MAX_OFFSET_TABLE_BYTES) {
-        return;
-      }
-      byte[] table = new byte[Math.toIntExact(offsetTableBytes)];
-      _rangeFetches.incrementAndGet();
-      _directory.readDataRange(_key, _baseOffset + offsetTableStart, table, table.length);
-      _offsetTableStart = offsetTableStart;
-      _offsetTable = table;
-    } catch (RuntimeException e) {
-      // Priming is an optimization; fall back to ordinary ranged reads
-      _offsetTable = null;
-    }
-  }
-
-  /** Serves a read out of the primed offset table when it covers the requested range. */
+  @Nullable
   private ByteBuffer readFromOffsetTable(long offset, int length) {
-    byte[] table = _offsetTable;
-    if (table == null || offset < _offsetTableStart || offset + length > _offsetTableStart + table.length) {
+    if (_baseOffset != 0) {
+      return null; // a view into a dictionary: the table's positions would not line up
+    }
+    PinotDataBuffer table = _directory.offsetTable(_key);
+    if (table == null) {
       return null;
     }
-    return ByteBuffer.wrap(table, Math.toIntExact(offset - _offsetTableStart), length).order(_order);
+    int start = _directory.offsetTableStart(_key);
+    if (offset < start || offset + length > start + table.size()) {
+      return null;
+    }
+    byte[] bytes = new byte[length];
+    table.copyTo(offset - start, bytes, 0, length);
+    return ByteBuffer.wrap(bytes).order(_order);
   }
 
   /**
-   * Returns a view of the resident entry matching this buffer's range and order, or null when the entry is
-   * not resident. Re-checked by identity per call so directory frees are honored.
+   * Returns a view of the resident entry matching this buffer's range and order, waiting for an in-flight
+   * fetch of the entry, or null when the entry is not resident. Re-checked by identity per call so directory
+   * frees are honored.
    */
+  @Nullable
   private PinotDataBuffer residentView() {
-    PinotDataBuffer resident = _directory.peekResident(_key);
+    PinotDataBuffer resident = _directory.awaitResident(_key);
     if (resident == null) {
       _cachedResident = null;
       _cachedResidentView = null;
@@ -236,6 +248,27 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
     }
   }
 
+  /** Serves a read from the sub-range cache, or null when no cached range covers it. Caller holds the monitor. */
+  @Nullable
+  private ByteBuffer readCachedLocked(long offset, int length) {
+    Map.Entry<Long, byte[]> floor = _subRanges.floorEntry(offset);
+    if (floor != null && floor.getKey() + floor.getValue().length >= offset + length) {
+      return ByteBuffer.wrap(floor.getValue(), Math.toIntExact(offset - floor.getKey()), length).order(_order);
+    }
+    return null;
+  }
+
+  /** Returns the in-flight hinted range covering the read, or null. Caller holds the monitor. */
+  @Nullable
+  private PendingRange pendingCoveringLocked(long offset, int length) {
+    for (PendingRange pending : _pending) {
+      if (pending.covers(offset, length)) {
+        return pending;
+      }
+    }
+    return null;
+  }
+
   private boolean promotableSize() {
     return _size <= _directory.getMaxPromoteBytes();
   }
@@ -258,19 +291,34 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
       throw new IndexOutOfBoundsException(
           "Read [" + offset + ", +" + length + ") out of bounds for entry " + _key + " of size " + _size);
     }
-    // 0. Dictionary offset table: primed once, then served from memory
+    // 0. Dictionary offset table: materialized once (usually at plan time), then served locally
     if (_dictionary) {
-      primeDictionaryOffsets();
       ByteBuffer fromTable = readFromOffsetTable(offset, length);
       if (fromTable != null) {
         return fromTable;
       }
     }
-    // 1. Cached sub-range?
+    // 1. Cached sub-range, or a hinted range still in flight: wait for it rather than fetch around it
+    PendingRange pending;
     synchronized (_subRanges) {
-      Map.Entry<Long, byte[]> floor = _subRanges.floorEntry(offset);
-      if (floor != null && floor.getKey() + floor.getValue().length >= offset + length) {
-        return ByteBuffer.wrap(floor.getValue(), Math.toIntExact(offset - floor.getKey()), length).order(_order);
+      ByteBuffer cached = readCachedLocked(offset, length);
+      if (cached != null) {
+        return cached;
+      }
+      pending = pendingCoveringLocked(offset, length);
+    }
+    if (pending != null) {
+      try {
+        pending._done.join();
+      } catch (RuntimeException e) {
+        LOGGER.warn("Hinted fetch of {} failed for segment: {}; reading the range directly", _key,
+            _directory.getRemoteMetadata().getSegmentName(), e);
+      }
+      synchronized (_subRanges) {
+        ByteBuffer cached = readCachedLocked(offset, length);
+        if (cached != null) {
+          return cached;
+        }
       }
     }
     // 2. Promote the whole entry only when it is small enough to be worth holding; a query-mode miss
@@ -319,13 +367,25 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
 
   @Override
   public boolean wantsPrefetch() {
-    if (_cachedResident != null) {
-      // Already materialized locally: reads are memory-speed and hinting only adds work
+    if (_cachedResident != null || _directory.hasResident(_key)) {
+      // Already materialized locally, or on its way whole (plan-time pin): reads are memory-speed once it lands,
+      // and hinting ranges of it would only add requests for bytes already in flight
       return false;
     }
     return true;
   }
 
+  @Override
+  public boolean remoteBacked() {
+    return true;
+  }
+
+  /**
+   * Starts fetching the hinted ranges, merged into a bounded number of requests, and returns at once. Ranges
+   * already cached or already in flight are skipped; the reads that follow wait for exactly the range they
+   * need (see {@link #readSlow}). Declines — leaving the promote-on-miss path to pull the entry whole — when
+   * the batch is so scattered or so large that reading the entry in one go is the cheaper plan.
+   */
   @Override
   public void prefetchRanges(long[] offsets, int[] lengths, int count) {
     if (count <= 0) {
@@ -376,37 +436,61 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
     }
     if (total > MAX_PREFETCH_BYTES || total * WHOLE_ENTRY_PREFETCH_RATIO > _size
         || merged.size() > MAX_PREFETCH_RANGES) {
-      // Reading the entry whole is now the cheaper plan (a full scan looks like this, and so does a
-      // batch too scattered to merge). Decline; the promote-on-miss path pulls it in one bounded read.
+      // Reading the entry whole is now the cheaper plan (a full scan looks like this, and so does a batch too
+      // scattered to merge). For an entry a miss may promote, decline and let the promote-on-miss path pull it
+      // in one bounded read. For a bigger one — a high-cardinality string dictionary being resolved for
+      // thousands of group keys — start the whole-entry fetch now: the alternative measured as one 16 KB round
+      // trip per value, which no amount of parallelism turns into a sub-second query.
+      if (!promotableSize() && _baseOffset == 0 && _size <= HINTED_PROMOTE_MAX_BYTES) {
+        _directory.promoteAsync(_key);
+      }
       return;
     }
     List<long[]> toFetch = new ArrayList<>(merged.size());
     List<byte[]> targets = new ArrayList<>(merged.size());
-    for (long[] range : merged) {
-      long start = range[0];
-      int len = Math.toIntExact(Math.min(range[1] - start, _size - start));
-      if (len <= 0) {
-        continue;
-      }
-      synchronized (_subRanges) {
-        Map.Entry<Long, byte[]> floor = _subRanges.floorEntry(start);
-        if (floor != null && floor.getKey() + floor.getValue().length >= start + len) {
+    CompletableFuture<Void> done = new CompletableFuture<>();
+    List<PendingRange> registered = new ArrayList<>(merged.size());
+    synchronized (_subRanges) {
+      PinotDataBuffer offsetTable = _dictionary && _baseOffset == 0 ? _directory.peekOffsetTable(_key) : null;
+      long offsetTableStart = offsetTable != null ? _directory.offsetTableStart(_key) : -1;
+      for (long[] range : merged) {
+        long start = range[0];
+        int len = Math.toIntExact(Math.min(range[1] - start, _size - start));
+        if (len <= 0 || readCachedLocked(start, len) != null || pendingCoveringLocked(start, len) != null) {
           continue;
         }
+        if (offsetTable != null && start >= offsetTableStart && start + len <= offsetTableStart + offsetTable.size()) {
+          continue; // served from the primed offset table, nothing to fetch
+        }
+        // element 0 is the offset to read, element 1 the key this range is cached under
+        toFetch.add(new long[]{_baseOffset + start, start});
+        targets.add(new byte[len]);
+        PendingRange pending = new PendingRange(start, start + len, done);
+        registered.add(pending);
+        _pending.add(pending);
       }
-      // element 0 is the offset to read, element 1 the key this range is cached under
-      toFetch.add(new long[]{_baseOffset + start, start});
-      targets.add(new byte[len]);
     }
     if (toFetch.isEmpty()) {
       return;
     }
-    // One call, so the batch's ranges are all in flight together rather than each waiting its turn
+    // One call, so the batch's ranges are all in flight together rather than each waiting its turn — and off
+    // this thread, so the caller can go on to hint its other columns before anything is waited for.
     _rangeFetches.addAndGet(toFetch.size());
-    _directory.readDataRanges(_key, toFetch, targets);
-    for (int i = 0; i < toFetch.size(); i++) {
-      cacheSubRange(toFetch.get(i)[1], targets.get(i));
-    }
+    _directory.readDataRangesAsync(_key, toFetch, targets).whenComplete((ignored, error) -> {
+      if (error == null) {
+        for (int i = 0; i < toFetch.size(); i++) {
+          cacheSubRange(toFetch.get(i)[1], targets.get(i));
+        }
+      }
+      synchronized (_subRanges) {
+        _pending.removeAll(registered);
+      }
+      if (error == null) {
+        done.complete(null);
+      } else {
+        done.completeExceptionally(error);
+      }
+    });
   }
 
   @Override
@@ -534,11 +618,11 @@ public class RemoteSegmentBuffer extends PinotDataBuffer {
   public void release() {
     _cachedResident = null;
     _cachedResidentView = null;
-    _offsetTable = null;
-    _offsetTablePrimed = false;
     synchronized (_subRanges) {
       _subRanges.clear();
       _cachedSubRangeBytes = 0;
+      // In-flight hints complete into an empty cache; nothing waits on them any more
+      _pending.clear();
     }
   }
 }

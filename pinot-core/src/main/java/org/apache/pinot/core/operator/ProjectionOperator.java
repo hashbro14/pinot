@@ -90,6 +90,9 @@ public class ProjectionOperator extends BaseProjectOperator<ProjectionBlock> imp
     } else {
       Tracing.activeRecording().setNumChildren(_dataSourceMap.size());
       _dataBlockCache.initNewBlock(docIdSetBlock.getDocIds(), docIdSetBlock.getLength());
+      // Hint every column before any is read: against remote storage this pipelines the block's fetches across
+      // columns (one round trip per block) instead of paying one per column; local readers ignore it.
+      _dataFetcher.prefetch(docIdSetBlock.getDocIds(), docIdSetBlock.getLength());
       return new ProjectionBlock(_dataSourceMap, _dataBlockCache);
     }
   }

@@ -157,6 +157,11 @@ public abstract class BaseImmutableDictionary implements Dictionary {
     }
   }
 
+  @Override
+  public void prefetch(int[] dictIds, int length) {
+    prefetchValues(dictIds, length);
+  }
+
   protected final int normalizeIndex(int index) {
     return index >= 0 ? index : NULL_VALUE_INDEX;
   }

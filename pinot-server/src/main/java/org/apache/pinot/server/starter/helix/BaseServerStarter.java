@@ -88,6 +88,7 @@ import org.apache.pinot.core.data.manager.realtime.RealtimeConsumptionRateManage
 import org.apache.pinot.core.data.manager.realtime.ServerRateLimitConfigChangeListener;
 import org.apache.pinot.core.instance.context.ServerContext;
 import org.apache.pinot.core.query.killing.QueryKillingManager;
+import org.apache.pinot.core.query.prefetch.RemoteQueryBootstrap;
 import org.apache.pinot.core.query.scheduler.QuerySchedulerThreadPoolConfigChangeListener;
 import org.apache.pinot.core.query.scheduler.resources.ResourceManager;
 import org.apache.pinot.core.transport.ListenerConfig;
@@ -99,6 +100,7 @@ import org.apache.pinot.query.runtime.KeepPipelineBreakerStatsPredicate;
 import org.apache.pinot.query.runtime.SendStatsPredicate;
 import org.apache.pinot.query.runtime.operator.factory.DefaultQueryOperatorFactoryProvider;
 import org.apache.pinot.query.runtime.operator.factory.QueryOperatorFactoryProvider;
+import org.apache.pinot.segment.local.loader.RemoteSegmentDirectoryLoader;
 import org.apache.pinot.segment.local.realtime.impl.invertedindex.RealtimeLuceneIndexRefreshManager;
 import org.apache.pinot.segment.local.realtime.impl.invertedindex.RealtimeLuceneTextIndexSearcherPool;
 import org.apache.pinot.segment.local.segment.store.TextIndexUtils;
@@ -781,6 +783,12 @@ public abstract class BaseServerStarter implements ServiceStartable {
     SendStatsPredicate sendStatsPredicate = SendStatsPredicate.create(_serverConf, _helixManager);
     KeepPipelineBreakerStatsPredicate keepPipelineBreakerStatsPredicate =
         KeepPipelineBreakerStatsPredicate.create(_serverConf);
+    // Remote (deep-store) querying: must be wired before the query executor freezes its fetch planner
+    PinotConfiguration instanceConfig = _serverConf.subset(Server.INSTANCE_DATA_MANAGER_CONFIG_PREFIX);
+    if (RemoteSegmentDirectoryLoader.NAME.equals(
+        instanceConfig.getProperty(HelixInstanceDataManagerConfig.SEGMENT_DIRECTORY_LOADER))) {
+      RemoteQueryBootstrap.bootstrap(instanceConfig);
+    }
     _serverInstance =
         new ServerInstance(serverConf, _instanceId, _helixManager, _accessControlFactory,
             _segmentOperationsThrottlerSet,

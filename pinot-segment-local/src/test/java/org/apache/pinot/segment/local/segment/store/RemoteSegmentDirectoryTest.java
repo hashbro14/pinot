@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.commons.io.FileUtils;
+import org.apache.pinot.segment.local.io.util.VarLengthValueReader;
 import org.apache.pinot.segment.local.io.util.VarLengthValueWriter;
 import org.apache.pinot.segment.local.segment.index.readers.StringDictionary;
 import org.apache.pinot.segment.spi.FetchContext;
@@ -250,7 +251,9 @@ public class RemoteSegmentDirectoryTest {
     assertNull(_directory.peekResident(dictKey));
     _directory.prefetch(fetchContext);
     _directory.acquire(fetchContext);
-    assertNotNull(_directory.peekResident(dictKey), "entry must be resident after acquire");
+    // acquire does not block: the entry is in flight or resident, and the first read waits for it
+    assertNotNull(_directory.awaitResident(dictKey), "entry must be resident once awaited after acquire");
+    assertNotNull(_directory.peekResident(dictKey));
     assertTrue(_directory.inQueryMode());
 
     // Reads while resident are served from memory
@@ -316,7 +319,7 @@ public class RemoteSegmentDirectoryTest {
         Map.of(COLUMN, List.<IndexType<?, ?, ?>>of(StandardIndexes.dictionary())));
     _directory.acquire(second);
     assertTrue(_directory.inQueryMode(), "second query must still enter query mode");
-    assertNotNull(_directory.peekResident(dictKey));
+    assertNotNull(_directory.awaitResident(dictKey));
     _directory.release(second);
     assertFalse(_directory.inQueryMode());
     assertNull(_directory.peekResident(dictKey), "entry must be freed after the second query releases");
@@ -357,5 +360,111 @@ public class RemoteSegmentDirectoryTest {
   public void testNonRemoteTableIsIgnored() {
     TableConfig plain = new TableConfigBuilder(TableType.OFFLINE).setTableName("plain").build();
     assertNull(RemoteQueryConfigs.fromTableConfig(plain), "plain tables must not be treated as remote");
+  }
+
+  @Test
+  public void testPlanPrefetchPinsSmallEntriesAndPrimesOffsetTableOfLargeOnes()
+      throws Exception {
+    // Pin ceiling between the two dictionaries: the int dictionary (64 KB) is pinned whole, the var-length
+    // string dictionary (~300 KB) only gets its offset table
+    RemoteSegmentDirectory directory = new RemoteSegmentDirectory(_remoteMetadata,
+        new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30),
+        RemoteQueryConfigs.DEFAULT_MAX_FETCH_BYTES_PER_QUERY, /* maxPromoteBytes */ 1024, true, 100 * 1024);
+    try {
+      IndexKey intDictKey = new IndexKey(COLUMN, StandardIndexes.dictionary());
+      IndexKey strDictKey = new IndexKey(STRING_COLUMN, StandardIndexes.dictionary());
+      FetchContext fetchContext = new FetchContext(UUID.randomUUID(), SEGMENT_NAME,
+          Map.of(COLUMN, List.<IndexType<?, ?, ?>>of(StandardIndexes.dictionary()), STRING_COLUMN,
+              List.<IndexType<?, ?, ?>>of(StandardIndexes.dictionary())));
+      directory.prefetch(fetchContext);
+      directory.acquire(fetchContext);
+      assertNotNull(directory.awaitResident(intDictKey), "small dictionary must be pinned whole");
+      assertNull(directory.peekResident(strDictKey), "large dictionary must not be pinned whole");
+      PinotDataBuffer offsetTable = directory.offsetTable(strDictKey);
+      assertNotNull(offsetTable, "large var-length dictionary must have its offset table primed");
+      assertEquals(offsetTable.size(), (NUM_STRINGS + 1L) * Integer.BYTES);
+
+      // Offset lookups are served from the table: resolving a value costs one ranged read at most (nothing is
+      // promotable here, so a miss cannot hide behind a whole-entry promotion)
+      SegmentDirectory.Reader reader = directory.createReader();
+      RemoteSegmentBuffer strDict =
+          (RemoteSegmentBuffer) reader.getIndexFor(STRING_COLUMN, StandardIndexes.dictionary());
+      VarLengthValueReader valueReader = new VarLengthValueReader(strDict);
+      long fetchesBefore = strDict.getRangeFetchCount();
+      assertEquals(valueReader.getUnpaddedString(7, 64, new byte[64]), expectedString(7));
+      assertTrue(strDict.getRangeFetchCount() - fetchesBefore <= 1,
+          "with the offset table local a lookup is at most one ranged read");
+
+      directory.release(fetchContext);
+      assertFalse(directory.inQueryMode());
+      assertNull(directory.peekResident(intDictKey));
+    } finally {
+      directory.close();
+    }
+  }
+
+  @Test
+  public void testHintedRangesAreFetchedAsynchronouslyAndReadsWaitForThem()
+      throws Exception {
+    // No query active and the entry is not promotable, so reads go through the ranged path
+    RemoteSegmentDirectory directory = new RemoteSegmentDirectory(_remoteMetadata,
+        new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30),
+        RemoteQueryConfigs.DEFAULT_MAX_FETCH_BYTES_PER_QUERY, /* maxPromoteBytes */ 1024, false);
+    try {
+      SegmentDirectory.Reader reader = directory.createReader();
+      RemoteSegmentBuffer fwd = (RemoteSegmentBuffer) reader.getIndexFor(COLUMN, StandardIndexes.forward());
+      // Two clusters of values far apart: two merged ranges, one batch, in flight together
+      long[] offsets = {0, 4, 8, 200_000L, 200_004L};
+      int[] lengths = {4, 4, 4, 4, 4};
+      fwd.prefetchRanges(offsets, lengths, offsets.length);
+      assertEquals(fwd.getRangeFetchCount(), 2, "one request per merged range, issued at hint time");
+      // Reads inside the hinted ranges wait for them instead of fetching again
+      assertEquals(fwd.getInt(0), 3);
+      assertEquals(fwd.getInt(8), 2 * 17 + 3);
+      assertEquals(fwd.getInt(200_004L), (200_004 / 4) * 17 + 3);
+      assertEquals(fwd.getRangeFetchCount(), 2, "hinted reads must not issue further requests");
+      // A repeat hint for covered ranges is a no-op
+      fwd.prefetchRanges(offsets, lengths, offsets.length);
+      assertEquals(fwd.getRangeFetchCount(), 2);
+    } finally {
+      directory.close();
+    }
+  }
+
+  @Test
+  public void testReleaseWhileFetchInFlightClosesTheMappingOnceItLands()
+      throws Exception {
+    // A slow fetcher: the query releases before its pinned entry has landed
+    String latencyKey =
+        RemoteQueryConfigs.INSTANCE_PROPERTY_PREFIX + RemoteQueryConfigs.INSTANCE_FETCH_DEBUG_LATENCY_MS;
+    System.setProperty(latencyKey, "400");
+    RemoteIndexFetcher slowFetcher;
+    try {
+      slowFetcher = new RemoteIndexFetcher(4, RemoteQueryConfigs.DEFAULT_COALESCE_GAP_BYTES, 30);
+    } finally {
+      System.clearProperty(latencyKey);
+    }
+    RemoteSegmentDirectory directory = new RemoteSegmentDirectory(_remoteMetadata, slowFetcher,
+        RemoteQueryConfigs.DEFAULT_MAX_FETCH_BYTES_PER_QUERY, RemoteQueryConfigs.promoteMaxBytes(), true);
+    try {
+      long mappedBefore = PinotDataBuffer.getMmapBufferCount();
+      IndexKey fwdKey = new IndexKey(COLUMN, StandardIndexes.forward());
+      FetchContext fetchContext = new FetchContext(UUID.randomUUID(), SEGMENT_NAME,
+          Map.of(COLUMN, List.<IndexType<?, ?, ?>>of(StandardIndexes.forward())));
+      directory.prefetch(fetchContext);
+      directory.acquire(fetchContext);
+      assertTrue(directory.hasResident(fwdKey), "entry must be in flight");
+      assertNull(directory.peekResident(fwdKey), "entry must not have landed yet");
+      directory.release(fetchContext);
+      assertFalse(directory.hasResident(fwdKey), "release must drop the in-flight entry");
+      // The fetch still completes; its mapping must be closed by the completion, not left to leak
+      long deadline = System.currentTimeMillis() + 5_000;
+      while (PinotDataBuffer.getMmapBufferCount() != mappedBefore && System.currentTimeMillis() < deadline) {
+        Thread.sleep(50);
+      }
+      assertEquals(PinotDataBuffer.getMmapBufferCount(), mappedBefore, "mapping of the abandoned fetch must be closed");
+    } finally {
+      directory.close();
+    }
   }
 }

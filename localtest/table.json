@@ -1,0 +1,44 @@
+{
+  "tableName": "artist_dashboard_daily_streams_aggregated",
+  "tableType": "OFFLINE",
+  "segmentsConfig": {
+    "timeColumnName": "day_dt",
+    "segmentPushType": "APPEND",
+    "replication": "1",
+    "retentionTimeUnit": "DAYS",
+    "retentionTimeValue": "3650"
+  },
+  "tenants": {},
+  "routing": {
+    "segmentPrunerTypes": [
+      "time"
+    ]
+  },
+  "tableIndexConfig": {
+    "loadMode": "MMAP",
+    "sortedColumn": [
+      "artist_id"
+    ],
+    "starTreeIndexConfigs": [
+      {
+        "dimensionsSplitOrder": [
+          "day_dt",
+          "artist_id"
+        ],
+        "skipStarNodeCreationForDimensions": [],
+        "functionColumnPairs": [
+          "SUM__all_streams",
+          "SUM__full_streams",
+          "SUM__total_seconds_streamed"
+        ],
+        "maxLeafRecords": 10000
+      }
+    ]
+  },
+  "metadata": {
+    "customConfigs": {
+      "remote.query.enabled": "true",
+      "remote.query.base.uri": "file:///deepstore/remote/artist_dashboard_daily_streams_aggregated/"
+    }
+  }
+}

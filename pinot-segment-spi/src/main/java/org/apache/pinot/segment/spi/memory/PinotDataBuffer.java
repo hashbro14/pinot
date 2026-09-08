@@ -404,6 +404,15 @@ public abstract class PinotDataBuffer implements DataBuffer {
   }
 
   /**
+   * True when the buffer's bytes live in remote object storage, whether or not they are currently local. Unlike
+   * {@link #wantsPrefetch()} this does not change as entries are made resident; callers use it to decide whether
+   * the structures a read depends on (a dictionary, for a dictionary-encoded forward index) are worth hinting.
+   */
+  public boolean remoteBacked() {
+    return false;
+  }
+
+  /**
    * Hints that the first {@code count} ranges of {@code offsets}/{@code lengths} are about to be read.
    *
    * <p>Advisory: implementations may fetch all, some, or none of them, and reads stay correct either
