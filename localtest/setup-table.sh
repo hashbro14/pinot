@@ -10,7 +10,12 @@ for i in $(seq 1 30); do
   curl -sf -X POST $C/schemas -H 'Content-Type: application/json' -d @"$DIR/schema.json" && echo && break
   echo "controller not ready for writes yet ($i)"; sleep 3
 done
-curl -sf -X POST $C/tables -H 'Content-Type: application/json' -d @"$DIR/table.json" && echo
+# table creation also fails until the broker/server instances have registered their tenants: retry it too
+for i in $(seq 1 30); do
+  curl -sf -X POST $C/tables -H 'Content-Type: application/json' -d @"$DIR/table.json" && echo && break
+  echo "table not accepted yet ($i)"; sleep 3
+done
+curl -sf $C/tables/$T >/dev/null || { echo "table creation failed"; exit 1; }
 for d in 2026-04-09 2026-06-22; do
   tar=$(ls ~/pinot-ingest/work/$d/segments/*.tar.gz)
   echo "uploading $(basename $tar)"

@@ -13,7 +13,7 @@ for i in $(seq 1 80); do
   sleep 3
 done
 docker exec lp-server grep "Remote querying enabled" /logs/pinot-all.log | tail -1 | sed 's/.*Remote querying enabled/server: remote querying enabled/' | cut -c1-200
-"$DIR/setup-table.sh" >/dev/null 2>&1
+"$DIR/setup-table.sh" 2>&1 | grep -E "not (ready|accepted)|failed" || true
 for i in $(seq 1 80); do
   [ "$(curl -s localhost:9001/tables/artist_dashboard_daily_streams_aggregated/externalview | grep -o ONLINE | wc -l | tr -d ' ')" = "2" ] && break
   sleep 3
